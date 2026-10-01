@@ -10,7 +10,7 @@ from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from ..errors import BadRequest, NotFound
-from ..models import Node
+from ..models import Class, Node
 
 FOLDER_COLORS = (
     "oxblood",
@@ -52,14 +52,14 @@ def unwanted_in_name(ch: str) -> bool:
     return category in ("Cc", "Cs", "Co")
 
 
-def clean_name(name: str) -> str:
+def clean_name(name: str, max_length: int = 255) -> str:
     """Validate a user-supplied item name."""
     cleaned = "".join(ch for ch in unicodedata.normalize("NFC", name or "") if not unwanted_in_name(ch))
     cleaned = " ".join(cleaned.split())
     if all(ch.isspace() or ch in KEPT_FORMAT_CHARS for ch in cleaned):
         raise BadRequest("Please enter a name.", code="invalid_name")
-    if len(cleaned) > 255:
-        raise BadRequest("Names can be at most 255 characters long.", code="invalid_name")
+    if len(cleaned) > max_length:
+        raise BadRequest(f"Names can be at most {max_length} characters long.", code="invalid_name")
     return cleaned
 
 
@@ -88,6 +88,17 @@ def owned_folder_or_root(db: Session, user_id: str, folder_id: str | None) -> No
     if folder_id in (None, "", "root"):
         return None
     return owned_node(db, user_id, folder_id, "folder")
+
+
+def owned_class_ids(db: Session, user_id: str, class_ids: Sequence[str]) -> list[str]:
+    """``class_ids`` without duplicates; 404 unless every one is the user's."""
+    wanted = list(dict.fromkeys(class_ids))
+    found: set[str] = set()
+    for part in chunks(wanted):
+        found.update(db.scalars(select(Class.id).where(Class.id.in_(part), Class.owner_id == user_id)))
+    if len(found) != len(wanted):
+        raise NotFound("That class could not be found.")
+    return wanted
 
 
 def ancestors(db: Session, node_id: str) -> list[dict[str, Any]]:

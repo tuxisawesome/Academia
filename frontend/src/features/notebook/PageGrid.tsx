@@ -1,13 +1,17 @@
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { Check, ZoomIn } from "lucide-react";
 import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from "react";
+import { useClassMap } from "../../api/queries";
 import type { PageRef } from "../../api/types";
+import { PageTags, tagSummary } from "../../components/PageTags";
 import { PageThumb } from "../../components/PageThumb";
 import { useElementSize } from "../../lib/hooks";
 
 const GAP = 14;
 const PAD = 18;
 const LABEL_H = 26;
+/** Narrower tiles show a page's classes as colored dots, without their names. */
+const NAMED_TAGS_MIN = 160;
 
 export interface PageGridHandle {
   scrollToIndex: (index: number) => void;
@@ -65,6 +69,7 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     ariaLabel,
   } = props;
   const scrollRef = useRef<HTMLDivElement>(null);
+  const classes = useClassMap();
   const { width } = useElementSize(scrollRef);
   const tileHeight = Math.round(tileWidth * 1.3);
   const colW = tileWidth + GAP;
@@ -402,6 +407,7 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
                 const isSel = selected.has(page.id);
                 const colors = markers?.get(page.id) ?? [];
                 const dim = highlight && highlight.size > 0 && !highlight.has(page.id);
+                const tags = tagSummary([page], classes);
                 return (
                   <div
                     key={page.id}
@@ -412,12 +418,20 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
                     data-page-index={index}
                     role="option"
                     aria-selected={isSel}
-                    aria-label={`Page ${labelFor ? labelFor(index, page) : index + 1}`}
+                    aria-label={`Page ${labelFor ? labelFor(index, page) : index + 1}${tags ? `, ${tags}` : ""}`}
                     onClick={(e) => onTileClick(e, index)}
                     onDoubleClick={() => (mode === "pick" ? onPreview?.(index) : onOpen?.(index))}
                   >
                     <div className="pg-frame" style={{ height: tileHeight }}>
                       <PageThumb page={page} boxWidth={tileWidth - 12} boxHeight={tileHeight - 12} />
+                      {tags && (
+                        <PageTags
+                          pages={[page]}
+                          classes={classes}
+                          compact={tileWidth < NAMED_TAGS_MIN}
+                          className="pg-tags"
+                        />
+                      )}
                       {colors.length > 0 && (
                         <div className="pg-markers" aria-hidden="true">
                           {colors.slice(0, 4).map((c, k) => (

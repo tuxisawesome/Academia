@@ -84,6 +84,86 @@
   color: var(--danger);
 }
 
+.class-add {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.class-add .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.class-add .btn {
+  flex: none;
+}
+
+.class-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 6px;
+}
+
+.class-list li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 46px;
+  padding: 6px 8px 6px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.class-color-btn {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  flex: none;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  cursor: pointer;
+}
+
+.class-color-btn:hover {
+  background: var(--bg-hover);
+}
+
+.class-color-btn .class-dot {
+  width: 14px;
+  height: 14px;
+}
+
+.class-name,
+.class-rename {
+  flex: 1;
+  min-width: 0;
+}
+
+.class-name {
+  font-weight: 500;
+}
+
+.class-list .class-rename {
+  height: 32px;
+}
+
+.class-count {
+  color: var(--ink-muted);
+  font-size: 13.5px;
+  white-space: nowrap;
+}
+
+.class-actions {
+  display: flex;
+  flex: none;
+}
+
 .about-list {
   display: grid;
   gap: 8px;
@@ -193,6 +273,18 @@
 
   .settings-card {
     padding: 18px 16px;
+  }
+
+  .class-list li {
+    flex-wrap: wrap;
+  }
+
+  .class-name {
+    flex-basis: 50%;
+  }
+
+  .class-actions {
+    margin-left: auto;
   }
 
   .ut-row {

@@ -10,14 +10,16 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import defaultdict
+from collections.abc import Iterable, Sequence
+from datetime import date
 from typing import Any
 
-from sqlalchemy import select, text
+from sqlalchemy import exists, select, text
 from sqlalchemy.orm import Session
 
-from ..models import BOOKMARK, FOLDER, NOTEBOOK, Bookmark, Node, Page, SourcePage
-from .common import chunks, descendant_ids, owned_folder_or_root
-from .describe import bookmark_members, describe_nodes, page_json
+from ..models import BOOKMARK, FOLDER, NOTEBOOK, Bookmark, Node, Page, PageClass, SourcePage
+from .common import chunks, descendant_ids, owned_class_ids, owned_folder_or_root
+from .describe import bookmark_members, describe_nodes, page_class_ids, page_json
 
 MAX_RESULTS = 200
 MAX_PAGES_PER_RESULT = 60
@@ -144,43 +146,75 @@ def _locations(db: Session, user_id: str):  # noqa: ANN202
     return location
 
 
-def search(db: Session, user_id: str, query: str, folder_id: str | None = None) -> dict[str, Any]:
+def tagged_pages(
+    db: Session, user_id: str, class_ids: Sequence[str], date_from: date | None, date_to: date | None
+) -> dict[str, str]:
+    """Live pages (of notebooks outside the Trash) with any of the classes and a date in the
+    range, mapped to their notebook. A page without a date never matches a date filter."""
+    stmt = (
+        select(Page.id, Page.notebook_id)
+        .join(Node, Node.id == Page.notebook_id)
+        .where(Node.owner_id == user_id, Node.trashed_at.is_(None), Page.deleted_at.is_(None))
+    )
+    if class_ids:
+        stmt = stmt.where(exists().where(PageClass.page_id == Page.id, PageClass.class_id.in_(class_ids)))
+    if date_from is not None:
+        stmt = stmt.where(Page.tag_date >= date_from)
+    if date_to is not None:
+        stmt = stmt.where(Page.tag_date <= date_to)
+    return {r.id: r.notebook_id for r in db.execute(stmt)}
+
+
+def _live_pages(db: Session, column: Any, values: Iterable[str]) -> list[tuple[Page, SourcePage | None]]:
+    out: list[tuple[Page, SourcePage | None]] = []
+    for part in chunks(list(values)):
+        rows = db.execute(
+            select(Page, SourcePage)
+            .outerjoin(SourcePage, (SourcePage.source_id == Page.source_id) & (SourcePage.idx == Page.source_index))
+            .where(column.in_(part), Page.deleted_at.is_(None))
+        ).all()
+        out.extend((page, sp) for page, sp in rows)
+    return out
+
+
+def search(
+    db: Session,
+    user_id: str,
+    query: str,
+    folder_id: str | None = None,
+    class_ids: Sequence[str] = (),
+    date_from: date | None = None,
+    date_to: date | None = None,
+) -> dict[str, Any]:
+    """With tag filters (classes, a date range) only pages that match them count, and an
+    empty query lists all of them."""
     folder = owned_folder_or_root(db, user_id, folder_id)
+    classes = owned_class_ids(db, user_id, class_ids)
     q = " ".join((query or "").split())
     scope = {"id": folder.id, "name": folder.name} if folder else None
-    if not q:
-        return {"query": q, "scope": scope, "files": [], "contents": []}
+    filtered = bool(classes) or date_from is not None or date_to is not None
+    filters = {
+        "classes": classes,
+        "from": date_from.isoformat() if date_from else None,
+        "to": date_to.isoformat() if date_to else None,
+    }
+    if not q and not filtered:
+        return {"query": q, "scope": scope, "filters": filters, "files": [], "contents": []}
 
     nodes = _scope_nodes(db, user_id, folder)
     location = _locations(db, user_id)
+    matched = matching_pages(db, user_id, q) if q else set()
+    tagged = tagged_pages(db, user_id, classes, date_from, date_to) if filtered else {}
 
-    # Files: every query word appears in the name (case- and accent-insensitive).
-    name_words = _word_re.findall(normalize(q)) or [normalize(q)]
-    file_hits = [n for n in nodes if all(w in normalize(n.name) for w in name_words)]
-    file_hits.sort(key=lambda n: (n.kind != FOLDER, normalize(n.name)))
-    files = describe_nodes(db, file_hits[:MAX_RESULTS])
-    for item in files:
-        item["location"] = location(item["parent_id"])
+    def is_hit(page: Page) -> bool:
+        if q and (page.source_id, page.source_index) not in matched:
+            return False
+        return not filtered or page.id in tagged
 
-    # Contents: pages whose text matches, grouped by notebook / bookmark in scope.
-    matched = matching_pages(db, user_id, q)
     notebooks = [n for n in nodes if n.kind == NOTEBOOK]
     bookmarks = [n for n in nodes if n.kind == BOOKMARK]
-    hits: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    if matched:
-        source_ids = list({sid for sid, _ in matched})
-        nb_ids = {n.id for n in notebooks}
-        for part in chunks(source_ids):
-            rows = db.execute(
-                select(Page, SourcePage)
-                .outerjoin(SourcePage, (SourcePage.source_id == Page.source_id) & (SourcePage.idx == Page.source_index))
-                .where(Page.source_id.in_(part), Page.deleted_at.is_(None))
-            ).all()
-            for page, sp in rows:
-                key = (page.source_id, page.source_index)
-                if page.notebook_id in nb_ids and key in matched:
-                    number = (page.position or 0) + 1
-                    hits[page.notebook_id].append({**page_json(page, sp), "number": number, "open_page": number})
+    members: dict[str, list[tuple[Page, SourcePage | None]]] = {}
+    if matched or tagged:
         # Bookmarks of a notebook in the Trash show nothing: their pages are only in the Trash.
         live_bm: set[str] = set()
         for part in chunks([b.id for b in bookmarks]):
@@ -192,23 +226,53 @@ def search(db: Session, user_id: str, query: str, folder_id: str | None = None) 
                 )
             )
         members = bookmark_members(db, list(live_bm))
-        for bm in bookmarks:
-            # open_page: the page's place within the bookmark (what the bookmark reader shows).
-            for k, (page, sp) in enumerate(members.get(bm.id, []), start=1):
-                key = (page.source_id, page.source_index)
-                if key in matched:
-                    hits[bm.id].append({**page_json(page, sp), "number": (page.position or 0) + 1, "open_page": k})
+
+    # Files: every query word appears in the name (case- and accent-insensitive). With tag
+    # filters, only notebooks and bookmarks that have a matching page.
+    file_hits = list(nodes)
+    if q:
+        name_words = _word_re.findall(normalize(q)) or [normalize(q)]
+        file_hits = [n for n in file_hits if all(w in normalize(n.name) for w in name_words)]
+    if filtered:
+        tagged_notebooks = set(tagged.values())
+        file_hits = [
+            n
+            for n in file_hits
+            if (n.kind == NOTEBOOK and n.id in tagged_notebooks)
+            or (n.kind == BOOKMARK and any(p.id in tagged for p, _ in members.get(n.id, [])))
+        ]
+    file_hits.sort(key=lambda n: (n.kind != FOLDER, normalize(n.name)))
+    files = describe_nodes(db, file_hits[:MAX_RESULTS])
+    for item in files:
+        item["location"] = location(item["parent_id"])
+
+    # Contents: matching pages, grouped by notebook / bookmark in scope, each with the page
+    # to open (for bookmarks its place within the bookmark: what the bookmark reader shows).
+    hits: dict[str, list[tuple[Page, SourcePage | None, int]]] = defaultdict(list)
+    nb_ids = {n.id for n in notebooks}
+    candidates = _live_pages(db, Page.source_id, {sid for sid, _ in matched}) if q else _live_pages(db, Page.id, tagged)
+    for page, sp in candidates:
+        if page.notebook_id in nb_ids and is_hit(page):
+            hits[page.notebook_id].append((page, sp, (page.position or 0) + 1))
+    for bm in bookmarks:
+        for k, (page, sp) in enumerate(members.get(bm.id, []), start=1):
+            if is_hit(page):
+                hits[bm.id].append((page, sp, k))
 
     by_id = {n.id: n for n in nodes}
     ranked = sorted(
         hits,
         key=lambda nid: (-len(hits[nid]), normalize(by_id[nid].name)),
     )[:MAX_RESULTS]
+    shown = {nid: sorted(hits[nid], key=lambda h: h[0].position or 0)[:MAX_PAGES_PER_RESULT] for nid in ranked}
+    class_ids_of = page_class_ids(db, [page.id for pages in shown.values() for page, _, _ in pages])
     contents = describe_nodes(db, [by_id[i] for i in ranked])
     for item in contents:
-        pages = sorted(hits[item["id"]], key=lambda m: m["number"])
         item["location"] = location(item["parent_id"])
-        item["match_count"] = len(pages)
-        item["matches"] = pages[:MAX_PAGES_PER_RESULT]
+        item["match_count"] = len(hits[item["id"]])
+        item["matches"] = [
+            {**page_json(page, sp, class_ids_of), "number": (page.position or 0) + 1, "open_page": open_page}
+            for page, sp, open_page in shown[item["id"]]
+        ]
 
-    return {"query": q, "scope": scope, "files": files, "contents": contents}
+    return {"query": q, "scope": scope, "filters": filters, "files": files, "contents": contents}

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { ApiError, isNotFound, isPageError } from "./client";
+import { ApiError, apiUrl, isNotFound, isPageError } from "./client";
 
 describe("isPageError", () => {
   const notFound = new ApiError(404, "not_found", "Not found.");
@@ -22,5 +22,16 @@ describe("isPageError", () => {
   it("is false without an error", () => {
     expect(isPageError(null, false)).toBe(false);
     expect(isNotFound(serverError)).toBe(false);
+  });
+});
+
+describe("apiUrl", () => {
+  it("leaves out empty parameters", () => {
+    expect(apiUrl("/search", { q: "", in: null, from: undefined, to: "2026-03-01" })).toBe("/api/search?to=2026-03-01");
+  });
+
+  it("repeats a parameter for each value of a list", () => {
+    expect(apiUrl("/search", { q: "a b", class: ["c1", "c2"] })).toBe("/api/search?q=a+b&class=c1&class=c2");
+    expect(apiUrl("/search", { class: [] })).toBe("/api/search");
   });
 });

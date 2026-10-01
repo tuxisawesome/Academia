@@ -3,17 +3,45 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from ..models import BOOKMARK, FOLDER, NOTEBOOK, Bookmark, BookmarkPage, Node, Notebook, Page, SourcePage
+from ..models import (
+    BOOKMARK,
+    FOLDER,
+    NOTEBOOK,
+    Bookmark,
+    BookmarkPage,
+    Class,
+    Node,
+    Notebook,
+    Page,
+    PageClass,
+    SourcePage,
+)
 from .common import chunks, live_children_count, segments, segments_label, trashed_children_count
 
 
-def page_json(page: Page, sp: SourcePage | None) -> dict[str, Any]:
+def page_class_ids(db: Session, page_ids: Iterable[str]) -> dict[str, list[str]]:
+    """The classes each page is tagged with, in the user's class order."""
+    out: dict[str, list[str]] = defaultdict(list)
+    for part in chunks(list(dict.fromkeys(page_ids))):
+        rows = db.execute(
+            select(PageClass.page_id, PageClass.class_id)
+            .join(Class, Class.id == PageClass.class_id)
+            .where(PageClass.page_id.in_(part))
+            .order_by(Class.position, Class.name)
+        ).all()
+        for page_id, class_id in rows:
+            out[page_id].append(class_id)
+    return out
+
+
+def page_json(page: Page, sp: SourcePage | None, class_ids: Mapping[str, list[str]]) -> dict[str, Any]:
+    """``class_ids`` comes from ``page_class_ids``, loaded once for all pages of a response."""
     return {
         "id": page.id,
         "source_id": page.source_id,
@@ -21,7 +49,14 @@ def page_json(page: Page, sp: SourcePage | None) -> dict[str, Any]:
         "rotation": page.rotation,
         "width": sp.width_pt if sp else 612.0,
         "height": sp.height_pt if sp else 792.0,
+        "date": page.tag_date.isoformat() if page.tag_date else None,
+        "class_ids": list(class_ids.get(page.id, ())),
     }
+
+
+def pages_json(db: Session, pages: Sequence[tuple[Page, SourcePage | None]]) -> list[dict[str, Any]]:
+    class_ids = page_class_ids(db, [p.id for p, _ in pages])
+    return [page_json(p, sp, class_ids) for p, sp in pages]
 
 
 def node_base(node: Node) -> dict[str, Any]:
@@ -81,7 +116,7 @@ def describe_nodes(db: Session, nodes: Sequence[Node]) -> list[dict[str, Any]]:
         child_counts.update(trashed_children_count(db, trashed_folder_ids))
 
     notebooks: dict[str, Notebook] = {}
-    covers: dict[str, dict[str, Any]] = {}
+    cover_pages: dict[str, tuple[Page, SourcePage | None]] = {}
     for part in chunks(nb_ids):
         notebooks.update({nb.node_id: nb for nb in db.scalars(select(Notebook).where(Notebook.node_id.in_(part)))})
         rows = db.execute(
@@ -92,7 +127,7 @@ def describe_nodes(db: Session, nodes: Sequence[Node]) -> list[dict[str, Any]]:
             )
             .where(Page.notebook_id.in_(part), Page.position == 0, Page.deleted_at.is_(None))
         ).all()
-        covers.update({p.notebook_id: page_json(p, sp) for p, sp in rows})
+        cover_pages.update({p.notebook_id: (p, sp) for p, sp in rows})
 
     bookmarks: dict[str, Bookmark] = {}
     for part in chunks(bm_ids):
@@ -102,6 +137,9 @@ def describe_nodes(db: Session, nodes: Sequence[Node]) -> list[dict[str, Any]]:
     for part in chunks(target_ids):
         targets.update({n.id: n for n in db.scalars(select(Node).where(Node.id.in_(part)))})
     members = bookmark_members(db, bm_ids) if bm_ids else {}
+    cover_pages.update({bid: pages[0] for bid, pages in members.items() if pages})
+    cover_classes = page_class_ids(db, [p.id for p, _ in cover_pages.values()])
+    covers = {nid: page_json(p, sp, cover_classes) for nid, (p, sp) in cover_pages.items()}
 
     out: list[dict[str, Any]] = []
     for node in nodes:
@@ -126,7 +164,7 @@ def describe_nodes(db: Session, nodes: Sequence[Node]) -> list[dict[str, Any]]:
                     "page_count": len(pages),
                     "segments": runs,
                     "label": segments_label(runs),
-                    "cover": page_json(*pages[0]) if pages else None,
+                    "cover": covers.get(node.id),
                 }
             )
         out.append(item)

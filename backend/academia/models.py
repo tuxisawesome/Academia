@@ -9,13 +9,14 @@ pointing at the same pages when the notebook is moved or its pages are reordered
 from __future__ import annotations
 
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from typing import Any
 
 from sqlalchemy import (
     JSON,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -189,6 +190,8 @@ class Page(Base):
     deleted_batch: Mapped[str | None] = mapped_column(String(36), index=True)
     # Place among live and other deleted pages, kept up to date for undo (see services/pages.py).
     deleted_position: Mapped[int | None] = mapped_column(Integer)
+    # The date the page is tagged with (at most one); its classes are in ``page_classes``.
+    tag_date: Mapped[date | None] = mapped_column(Date)
 
 
 class Bookmark(Base):
@@ -250,6 +253,33 @@ class Pin(Base):
     node_id: Mapped[str] = mapped_column(ForeignKey("nodes.id", ondelete="CASCADE"), primary_key=True)
     position: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Class(Base):
+    """A class (course) the user tags pages with, managed in Settings (per user, ordered).
+
+    Names are unique per user regardless of case; the service compares them with full
+    Unicode case folding; the NOCASE unique constraint backs that up for ASCII letters.
+    """
+
+    __tablename__ = "classes"
+    __table_args__ = (UniqueConstraint("owner_id", "name"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(80, collation="NOCASE"))
+    color: Mapped[str | None] = mapped_column(String(16))
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class PageClass(Base):
+    """A class a page is tagged with."""
+
+    __tablename__ = "page_classes"
+
+    page_id: Mapped[str] = mapped_column(ForeignKey("pages.id", ondelete="CASCADE"), primary_key=True)
+    class_id: Mapped[str] = mapped_column(ForeignKey("classes.id", ondelete="CASCADE"), primary_key=True, index=True)
 
 
 class PageText(Base):

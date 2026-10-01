@@ -25,15 +25,18 @@ import {
   ChevronLeft,
   ChevronRight,
   Scan,
+  Tag,
 } from "lucide-react";
 import { createBookmark, downloadNode, updatePrefs } from "../../api/actions";
 import { api, errorMessage, isPageError } from "../../api/client";
-import { queryClient, useBookmark, useMe, useNotebook, useProgress } from "../../api/queries";
+import { queryClient, useBookmark, useClassMap, useMe, useNotebook, useProgress } from "../../api/queries";
 import type { PageRef, Prefs } from "../../api/types";
 import { serverReachable } from "../../components/ConnectionGuard";
 import { MenuButton, type MenuEntry } from "../../components/Menu";
+import { PageTags } from "../../components/PageTags";
 import { PageThumb } from "../../components/PageThumb";
 import { bookmarkColor } from "../../lib/colors";
+import { plural } from "../../lib/format";
 import { isEditableTarget, useDocumentTitle, useIsNarrow } from "../../lib/hooks";
 import { shortcutKey } from "../../lib/keys";
 import { effectiveDark } from "../../lib/theme";
@@ -43,6 +46,7 @@ import { pageAfterLayoutChange, spreadLabel, spreadModeFor, spreadPages } from "
 import { reportNetworkError, reportServerUnavailable, useConnection } from "../../state/connection";
 import { promptDialog } from "../../state/dialogs";
 import { toast, toastError } from "../../state/toasts";
+import { TagPagesDialog, type TagTarget } from "../tags/TagPagesDialog";
 
 type Layout = Prefs["reader"]["layout"];
 type ScrollPref = "page" | "continuous";
@@ -120,6 +124,8 @@ function Reader() {
   const [loading, setLoading] = useState(true);
   const [sidebar, setSidebar] = useState<null | "pages" | "bookmarks">(null);
   const [fullscreen, setFullscreen] = useState(false);
+  const [tagging, setTagging] = useState<TagTarget | null>(null);
+  const classes = useClassMap();
   const settingsRef = useRef({ layout, coverAlone, scrollPref });
   settingsRef.current = { layout, coverAlone, scrollPref };
 
@@ -532,10 +538,42 @@ function Reader() {
     }
   };
 
+  // Tags live on the notebook's pages, also for the pages of a bookmark.
+  const notebookId = isBookmark ? bm?.notebook.id : nb?.id;
+  const notebookName = (isBookmark ? bm?.notebook.name : nb?.name) ?? "";
+  const tagShown = () => {
+    // The pages on screen, with their latest tags.
+    const ids = new Set(visible.map((n) => shownPages.current[n - 1]?.id));
+    const shown = pages.filter((p) => ids.has(p.id));
+    if (!notebookId || !shown.length) return;
+    const label = `${visible.length > 1 ? "pp." : "p."} ${indicator}`;
+    setTagging({ notebookId, pages: shown, description: `“${notebookName}”, ${label}.` });
+  };
+  const tagAll = () => {
+    if (!notebookId || !bm || !pages.length) return;
+    setTagging({
+      notebookId,
+      pages,
+      description: `The pages of the bookmark “${bm.name}”: ${bm.label} of “${notebookName}”.`,
+    });
+  };
+  const tagEntries: MenuEntry[] = [
+    { label: visible.length > 1 ? "Tag these pages…" : "Tag this page…", icon: <Tag />, onSelect: tagShown },
+    { label: `Tag all ${plural(pages.length, "page")} of the bookmark…`, icon: <Tag />, onSelect: tagAll },
+  ];
+
   // A failed background refetch keeps the document that is already open.
   const loadError = [nbQuery, bmQuery].find((q) => isPageError(q.error, !!q.data))?.error;
   const empty = !!(nb || bm) && pages.length === 0;
   const canRead = !inTrash && !unavailable && !empty;
+  const canTag = canRead && !!notebookId && numPages > 0;
+  const tagTitle = inTrash
+    ? `Restore the ${isBookmark ? "bookmark" : "notebook"} from the Trash to tag its pages`
+    : unavailable
+      ? "Restore the notebook from the Trash to tag these pages"
+      : "Tag pages";
+  // The tags of the pages on screen.
+  const visiblePages = visible.map((n) => pages[n - 1]).filter((p): p is PageRef => !!p);
   const retry = () => {
     if (loadError) void (isBookmark ? bmQuery : nbQuery).refetch();
     setReloadKey((k) => k + 1);
@@ -599,6 +637,15 @@ function Reader() {
         {!isBookmark && nb && !inTrash && !narrow && (
           <button className="icon-btn" aria-label="Bookmark these pages" title="Bookmark these pages" onClick={() => void bookmarkSpread()}>
             <BookmarkPlus />
+          </button>
+        )}
+        {isBookmark && canTag ? (
+          <MenuButton entries={tagEntries} label="Tag pages">
+            <Tag />
+          </MenuButton>
+        ) : (
+          <button className="icon-btn" aria-label="Tag pages" title={tagTitle} disabled={!canTag} onClick={tagShown}>
+            <Tag />
           </button>
         )}
         <button
@@ -754,6 +801,7 @@ function Reader() {
             {isBookmark ? `(${visible[0] ?? current} of ${numPages || pages.length})` : `of ${numPages || pages.length}`}
           </span>
         </span>
+        <PageTags pages={visiblePages} classes={classes} compact={narrow} className="reader-tags" />
         <input
           className="scrubber"
           type="range"
@@ -783,6 +831,7 @@ function Reader() {
           Go to…
         </button>
       </footer>
+      <TagPagesDialog target={tagging} onClose={() => setTagging(null)} />
     </div>
   );
 }

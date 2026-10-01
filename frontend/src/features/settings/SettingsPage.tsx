@@ -1,20 +1,46 @@
 import { useQuery } from "@tanstack/react-query";
-import { useEffect, useState } from "react";
-import { NavLink, useNavigate, useParams } from "react-router";
-import { Archive, Download, Info, LogOut, Palette, UserRound } from "lucide-react";
-import { logout, mergePrefs, updatePrefs } from "../../api/actions";
+import { useEffect, useRef, useState } from "react";
+import { Link, NavLink, useNavigate, useParams } from "react-router";
+import {
+  Archive,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  Info,
+  LogOut,
+  Palette,
+  Pencil,
+  Plus,
+  Tags,
+  Trash2,
+  UserRound,
+} from "lucide-react";
+import {
+  createClass,
+  deleteClass,
+  logout,
+  mergePrefs,
+  reorderClasses,
+  updateClass,
+  updatePrefs,
+} from "../../api/actions";
 import { api, downloadUrl, errorMessage } from "../../api/client";
-import { queryClient, useExports, useMe } from "../../api/queries";
-import type { ExportJob, Prefs, PrefsPatch, User } from "../../api/types";
+import { queryClient, useClasses, useExports, useMe } from "../../api/queries";
+import type { ClassItem, ExportJob, Prefs, PrefsPatch, User } from "../../api/types";
+import { MenuButton } from "../../components/Menu";
 import { APP_BUILD } from "../../state/connection";
-import { formatBytes, formatDate } from "../../lib/format";
+import { folderColorVar } from "../../lib/colors";
+import { formatBytes, formatDate, plural } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
+import { isImeKey } from "../../lib/keys";
+import { confirmDialog } from "../../state/dialogs";
 import { toast, toastError } from "../../state/toasts";
 import { PasswordForm } from "../auth/PasswordForm";
 
 const SECTIONS = [
   { key: "appearance", label: "Appearance", icon: <Palette /> },
   { key: "account", label: "Account", icon: <UserRound /> },
+  { key: "classes", label: "Classes", icon: <Tags /> },
   { key: "export", label: "Export", icon: <Archive /> },
   { key: "about", label: "About", icon: <Info /> },
 ] as const;
@@ -42,6 +68,7 @@ export function SettingsPage() {
           <div className="settings-body">
             {current === "appearance" && <AppearanceSettings />}
             {current === "account" && <AccountSettings />}
+            {current === "classes" && <ClassesSettings />}
             {current === "export" && <ExportSettings />}
             {current === "about" && <AboutSettings />}
           </div>
@@ -212,6 +239,200 @@ function AccountSettings() {
         </div>
       </Section>
     </>
+  );
+}
+
+/** The name field of a class being renamed: Enter or leaving it saves, Esc cancels. */
+function RenameClassInput({ item, onDone }: { item: ClassItem; onDone: (name: string | null) => void }) {
+  // Esc unmounts the field, which may blur it: only the first of the two counts.
+  const done = useRef(false);
+  const finish = (name: string | null) => {
+    if (done.current) return;
+    done.current = true;
+    onDone(name);
+  };
+  return (
+    <input
+      className="input class-rename"
+      autoFocus
+      defaultValue={item.name}
+      maxLength={80}
+      aria-label={`New name for ${item.name}`}
+      onFocus={(e) => e.target.select()}
+      onBlur={(e) => finish(e.target.value)}
+      onKeyDown={(e) => {
+        if (isImeKey(e.nativeEvent)) return;
+        if (e.key === "Enter") {
+          e.preventDefault();
+          finish(e.currentTarget.value);
+        } else if (e.key === "Escape") finish(null);
+      }}
+    />
+  );
+}
+
+function ClassesSettings() {
+  const { data: classes, isLoading } = useClasses();
+  const [name, setName] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [adding, setAdding] = useState(false);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+
+  const add = async () => {
+    if (!name.trim() || adding) return;
+    setAdding(true);
+    setError(null);
+    try {
+      await createClass(name.trim());
+      setName("");
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const rename = async (item: ClassItem, next: string | null) => {
+    setRenamingId(null);
+    const clean = next?.trim();
+    if (!clean || clean === item.name) return;
+    try {
+      await updateClass(item.id, { name: clean });
+    } catch (err) {
+      toastError(err);
+    }
+  };
+
+  const move = (index: number, by: -1 | 1) => {
+    if (!classes) return;
+    const ids = classes.map((c) => c.id);
+    [ids[index], ids[index + by]] = [ids[index + by], ids[index]];
+    reorderClasses(ids).catch(toastError);
+  };
+
+  const remove = async (item: ClassItem) => {
+    const ok = await confirmDialog({
+      title: `Delete the class “${item.name}”?`,
+      message: item.page_count
+        ? `${plural(item.page_count, "page")} will lose this tag. The pages themselves stay as they are.`
+        : "No pages are tagged with it.",
+      confirmLabel: "Delete class",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await deleteClass(item.id);
+      toast(`Deleted the class “${item.name}”.`);
+    } catch (err) {
+      toastError(err);
+    }
+  };
+
+  return (
+    <Section
+      title="Classes"
+      description="Tag notebook pages with your classes and a date, then find them with the filters on the search page. Only you see your classes."
+    >
+      <form
+        className="class-add"
+        onSubmit={(e) => {
+          e.preventDefault();
+          void add();
+        }}
+      >
+        <input
+          id="new-class"
+          className="input"
+          aria-label="New class"
+          placeholder="New class, e.g. Organic Chemistry"
+          maxLength={80}
+          value={name}
+          aria-invalid={!!error}
+          onChange={(e) => {
+            setName(e.target.value);
+            setError(null);
+          }}
+        />
+        <button className="btn btn-primary" disabled={adding || !name.trim()}>
+          <Plus /> Add class
+        </button>
+      </form>
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      {isLoading ? (
+        <div className="spinner" />
+      ) : !classes?.length ? (
+        <p className="muted">No classes yet. Add the classes you take notes for, then tag pages with them.</p>
+      ) : (
+        <ul className="class-list">
+          {classes.map((c, i) => (
+            <li key={c.id}>
+              <MenuButton
+                entries={[
+                  {
+                    type: "colors",
+                    value: c.color,
+                    onSelect: (color) => void updateClass(c.id, { color }).catch(toastError),
+                  },
+                ]}
+                label={`Color of ${c.name}`}
+                className="class-color-btn"
+                align="start"
+              >
+                <span className="class-dot" style={{ background: folderColorVar(c.color) }} />
+              </MenuButton>
+              {renamingId === c.id ? (
+                <RenameClassInput item={c} onDone={(next) => void rename(c, next)} />
+              ) : (
+                <span className="class-name truncate">{c.name}</span>
+              )}
+              <Link className="class-count tabular" to={`/search?class=${c.id}`} title="Show these pages">
+                {plural(c.page_count, "page")}
+              </Link>
+              <div className="class-actions">
+                <button
+                  className="icon-btn icon-btn-sm"
+                  aria-label={`Rename ${c.name}`}
+                  title="Rename"
+                  onClick={() => setRenamingId(c.id)}
+                >
+                  <Pencil />
+                </button>
+                <button
+                  className="icon-btn icon-btn-sm"
+                  aria-label={`Move ${c.name} up`}
+                  title="Move up"
+                  disabled={i === 0}
+                  onClick={() => move(i, -1)}
+                >
+                  <ChevronUp />
+                </button>
+                <button
+                  className="icon-btn icon-btn-sm"
+                  aria-label={`Move ${c.name} down`}
+                  title="Move down"
+                  disabled={i === classes.length - 1}
+                  onClick={() => move(i, 1)}
+                >
+                  <ChevronDown />
+                </button>
+                <button
+                  className="icon-btn icon-btn-sm"
+                  aria-label={`Delete ${c.name}`}
+                  title="Delete"
+                  onClick={() => void remove(c)}
+                >
+                  <Trash2 />
+                </button>
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+    </Section>
   );
 }
 

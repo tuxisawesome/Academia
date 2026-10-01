@@ -15,6 +15,7 @@ import {
   Pencil,
   RotateCcw,
   RotateCw,
+  Tag,
   Trash2,
   X,
   ZoomIn,
@@ -36,7 +37,7 @@ import {
 } from "../../api/actions";
 import { ApiError, errorMessage, isNotFound, isPageError } from "../../api/client";
 import { invalidateLibrary, queryClient, useNotebook } from "../../api/queries";
-import type { NotebookDetail } from "../../api/types";
+import type { NotebookBookmark, NotebookDetail } from "../../api/types";
 import { ContextMenuContent, MenuButton, type MenuEntry } from "../../components/Menu";
 import { bookmarkColor } from "../../lib/colors";
 import { plural } from "../../lib/format";
@@ -48,6 +49,7 @@ import { toast, toastError } from "../../state/toasts";
 import { MoveDialog } from "../explorer/dialogs";
 import { Breadcrumbs } from "../explorer/ExplorerPage";
 import { confirmTrash } from "../explorer/nodeActions";
+import { TagPagesDialog, type TagTarget } from "../tags/TagPagesDialog";
 import { PageGrid, useGridZoom, ZOOM_STEPS, type PageGridHandle } from "./PageGrid";
 import { PagePreview } from "./PagePreview";
 import { isPageShortcut } from "./shortcuts";
@@ -64,6 +66,7 @@ export function NotebookPage() {
   const [hoverBookmark, setHoverBookmark] = useState<string | null>(null);
   const [preview, setPreview] = useState<number | null>(null);
   const [moving, setMoving] = useState(false);
+  const [tagging, setTagging] = useState<TagTarget | null>(null);
   // Page under the last touch/pen press: Radix opens long-press menus by timer, without a contextmenu event on iOS.
   const pressedPage = useRef<string | null>(null);
   useDocumentTitle(nb?.name);
@@ -181,6 +184,16 @@ export function NotebookPage() {
       toast(`Added ${plural(ordered.length, "page")} to “${name}”.`);
     });
 
+  const tag = (pageIds: string[], description: string) => {
+    const ids = new Set(pageIds);
+    const tagged = pages.filter((p) => ids.has(p.id));
+    if (tagged.length) setTagging({ notebookId: nb.id, pages: tagged, description });
+  };
+
+  const tagSelection = () => tag(ordered, `“${nb.name}”, ${selectionLabel}.`);
+
+  const tagBookmark = (bm: NotebookBookmark) => tag(bm.page_ids, `The pages of the bookmark “${bm.name}” (${bm.label}).`);
+
   const readFrom = (index: number) => navigate(`/read/n/${nb.id}?page=${index + 1}`);
 
   const selectForMenu = (pid: string | null) => {
@@ -245,6 +258,7 @@ export function NotebookPage() {
         },
         { label: "Move to position…", icon: <MoveHorizontal />, onSelect: () => void moveToPosition() },
         { type: "sep" },
+        { label: "Tag pages…", icon: <Tag />, shortcut: "T", onSelect: tagSelection },
         { label: "Create bookmark…", icon: <BookmarkPlus />, onSelect: () => void makeBookmark() },
         {
           type: "sub",
@@ -301,6 +315,10 @@ export function NotebookPage() {
     } else if (e.key === "]" && canAct) void rotate(90);
     else if (e.key === "[" && canAct) void rotate(-90);
     else if (e.key === "Enter" && canAct) readFrom(indexOf.get(ordered[0]) ?? 0);
+    else if (shortcutKey(e) === "t" && !e.ctrlKey && !e.metaKey && !e.altKey && canAct) {
+      e.preventDefault();
+      tagSelection();
+    }
   }
 
   return (
@@ -355,6 +373,9 @@ export function NotebookPage() {
             </button>
             <button className="icon-btn" title="Delete (Del)" aria-label="Delete pages" onClick={() => void remove()}>
               <Trash2 />
+            </button>
+            <button className="btn btn-sm" aria-label="Tag pages" title="Tag pages (T)" onClick={tagSelection}>
+              <Tag /> {!narrow && "Tag…"}
             </button>
             <button className="btn btn-sm" onClick={() => void makeBookmark()}>
               <BookmarkPlus /> {!narrow && "Bookmark"}
@@ -456,6 +477,7 @@ export function NotebookPage() {
           <BookmarksPanel
             nb={nb}
             onHover={setHoverBookmark}
+            onTag={tagBookmark}
             onSelect={(ids) => {
               setSelected(new Set(ids));
               if (ids.length) gridRef.current?.scrollToIndex(indexOf.get(ids[0]) ?? 0);
@@ -473,6 +495,7 @@ export function NotebookPage() {
           labelFor={(i) => `Page ${i + 1} of ${pages.length}`}
         />
       )}
+      <TagPagesDialog target={tagging} onClose={() => setTagging(null)} />
       <MoveDialog
         targets={moving ? [nb] : null}
         onClose={() => setMoving(false)}
@@ -488,11 +511,13 @@ export function NotebookPage() {
 function BookmarksPanel({
   nb,
   onHover,
+  onTag,
   onSelect,
   onClose,
 }: {
   nb: NotebookDetail;
   onHover: (id: string | null) => void;
+  onTag: (bookmark: NotebookBookmark) => void;
   onSelect: (pageIds: string[]) => void;
   onClose: () => void;
 }) {
@@ -541,6 +566,15 @@ function BookmarksPanel({
                   onClick={() => navigate(`/b/${bm.id}/edit`)}
                 >
                   <Pencil />
+                </button>
+                <button
+                  className="icon-btn icon-btn-sm"
+                  aria-label={`Tag pages of ${bm.name}`}
+                  title={inTrashTitle("Tag pages")}
+                  disabled={inTrash || !bm.page_ids.length}
+                  onClick={() => onTag(bm)}
+                >
+                  <Tag />
                 </button>
                 <button
                   className="icon-btn icon-btn-sm"

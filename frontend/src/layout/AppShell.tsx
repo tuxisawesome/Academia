@@ -8,6 +8,7 @@ import { Wordmark } from "../components/Glyphs";
 import { MenuButton, type MenuEntry } from "../components/Menu";
 import { useIsNarrow } from "../lib/hooks";
 import { isImeKey } from "../lib/keys";
+import { filtersFromParams, hasFilters, withFilters } from "../lib/searchFilters";
 import { toastError } from "../state/toasts";
 import { FolderTree } from "./FolderTree";
 import { PinnedFolders } from "./PinnedFolders";
@@ -55,11 +56,20 @@ function SearchBox() {
     if (!onSearchPage) clearTimeout(timer.current);
   }, [onSearchPage, location.pathname]);
 
+  // The tag filters set on the results page apply to a new search there too. Read when the
+  // typing pause ends, like onSearchPageNow: a filter may have been chosen meanwhile.
+  const filters = onSearchPage ? filtersFromParams(params) : null;
+  const filtersNow = useRef(filters);
+  useEffect(() => {
+    filtersNow.current = filters;
+  });
+
   const go = (q: string, replace: boolean) => {
     clearTimeout(timer.current);
     sent.current = q;
-    const query = new URLSearchParams({ q });
+    let query = new URLSearchParams({ q });
     if (scope) query.set("in", scope.id);
+    if (filtersNow.current) query = withFilters(query, filtersNow.current);
     navigate(`/search?${query}`, { replace });
   };
 
@@ -78,7 +88,8 @@ function SearchBox() {
       role="search"
       onSubmit={(e) => {
         e.preventDefault();
-        if (value.trim()) go(value.trim(), onSearchPage);
+        // With filters set, an empty search lists every page they match.
+        if (value.trim() || (filters && hasFilters(filters))) go(value.trim(), onSearchPage);
       }}
     >
       <Search aria-hidden="true" />

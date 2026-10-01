@@ -723,6 +723,144 @@ kbd {
   height: 12px;
 }
 
+/* ---- Classes: tags on pages ------------------------------------------------------- */
+
+.class-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.class-chip {
+  gap: 6px;
+  max-width: 240px;
+}
+
+/* On some of the selected pages only. */
+.class-chip.partial {
+  background: transparent;
+  border: 1px dashed var(--border-strong);
+  color: var(--ink-muted);
+}
+
+.class-chip .chip-label {
+  width: auto;
+  height: auto;
+  border-radius: 0;
+  color: inherit;
+  font: inherit;
+}
+
+.class-chip .chip-label:hover {
+  background: transparent;
+  color: var(--ink);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.class-picker.input {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  height: auto;
+  min-height: 38px;
+  padding: 5px 10px;
+  cursor: text;
+}
+
+.class-picker:focus-within {
+  border-color: var(--gold);
+  box-shadow: 0 0 0 3px var(--gold-soft);
+}
+
+.class-picker input {
+  flex: 1;
+  min-width: 120px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font: inherit;
+  outline: none;
+}
+
+.class-picker input::placeholder {
+  color: var(--ink-faint);
+}
+
+.class-options {
+  width: var(--radix-popover-trigger-width);
+  max-width: calc(100vw - 16px);
+  max-height: min(280px, var(--radix-popover-content-available-height, 280px));
+  margin: 0;
+  list-style: none;
+  /* Above dialogs: the tag dialog has one. */
+  z-index: 90;
+}
+
+.class-options .menu-item {
+  cursor: pointer;
+}
+
+.class-options-empty {
+  padding: 6px 10px;
+  color: var(--ink-muted);
+  font-size: 14px;
+}
+
+/* A page's date and classes (thumbnails, search hits, the reader). */
+.page-tags {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  max-width: 100%;
+  font-size: 12px;
+  line-height: 1.3;
+  color: var(--ink-muted);
+}
+
+.page-tags .tag-date {
+  white-space: nowrap;
+}
+
+.page-tags .tag-class {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  max-width: 96px;
+}
+
+.page-tags .class-dot {
+  width: 8px;
+  height: 8px;
+}
+
+.tag-dots {
+  display: inline-flex;
+  gap: 3px;
+  flex: none;
+}
+
+.tag-date-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tag-date-row .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.tag-chips {
+  flex: none;
+}
+
 .divider {
   height: 1px;
   background: var(--border);

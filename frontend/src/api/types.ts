@@ -55,6 +55,10 @@ export interface PageRef {
   /** Display size in PDF points, after the page's own /Rotate (not our extra rotation). */
   width: number;
   height: number;
+  /** The page's date tag (YYYY-MM-DD), if any. */
+  date: string | null;
+  /** Ids of the classes the page is tagged with, in class order. */
+  class_ids: string[];
 }
 
 export interface BookmarkPage extends PageRef {
@@ -88,6 +92,16 @@ export interface LibraryNode {
   // trash
   item_count?: number;
   original_location?: string;
+}
+
+/** One of the user's classes, which pages can be tagged with (Settings → Classes). */
+export interface ClassItem {
+  id: string;
+  name: string;
+  color: FolderColor | null;
+  position: number;
+  /** Live pages in live notebooks tagged with the class. */
+  page_count: number;
 }
 
 export interface PathEntry {
@@ -196,9 +210,17 @@ export interface ContentResult extends LibraryNode {
   matches: ContentMatch[];
 }
 
+/** Tag filters of a search: pages with any of `classes`, dated from `from` to `to` (inclusive). */
+export interface SearchFilters {
+  classes: string[];
+  from: string | null;
+  to: string | null;
+}
+
 export interface SearchResults {
   query: string;
   scope: { id: string; name: string } | null;
   files: LibraryNode[];
   contents: ContentResult[];
+  filters: SearchFilters;
 }

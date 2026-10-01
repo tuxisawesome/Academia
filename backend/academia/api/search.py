@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 from ..services import pins
 from ..services import search as search_service
+from ..services.classes import MAX_CLASSES, parse_date
 from .deps import CurrentUser, Db
 
 router = APIRouter(tags=["search"])
@@ -23,8 +24,19 @@ def search(
     db: Db,
     q: str = Query(default="", max_length=200),
     folder: str | None = Query(default=None, alias="in"),
+    classes: list[str] = Query(default=[], alias="class", max_length=MAX_CLASSES),
+    date_from: str | None = Query(default=None, alias="from", max_length=32),
+    date_to: str | None = Query(default=None, alias="to", max_length=32),
 ) -> dict[str, Any]:
-    return search_service.search(db, user.id, q, folder)
+    return search_service.search(
+        db,
+        user.id,
+        q,
+        folder,
+        class_ids=classes,
+        date_from=parse_date(date_from) if date_from else None,
+        date_to=parse_date(date_to) if date_to else None,
+    )
 
 
 # ---- pins -----------------------------------------------------------------------------------

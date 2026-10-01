@@ -1,6 +1,14 @@
 import { QueryObserver } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createBookmark, deletePages, reorderPages, rotatePages, setBookmarkPages, undeletePages } from "./actions";
+import {
+  createBookmark,
+  deletePages,
+  reorderPages,
+  rotatePages,
+  setBookmarkPages,
+  tagPages,
+  undeletePages,
+} from "./actions";
 import { api } from "./client";
 import { queryClient } from "./queries";
 import type { NotebookDetail } from "./types";
@@ -25,12 +33,24 @@ function notebook(id: string, rev: number, pageIds = ["p1", "p2", "p3"]): Notebo
     pdf_digest: `digest-${rev}`,
     page_count: pageIds.length,
     path: [],
-    pages: pageIds.map((pid, index) => ({ id: pid, source_id: "s1", index, rotation: 0, width: 600, height: 800 })),
+    pages: pageIds.map((pid, index) => ({
+      id: pid,
+      source_id: "s1",
+      index,
+      rotation: 0,
+      width: 600,
+      height: 800,
+      date: null,
+      class_ids: [],
+    })),
     bookmarks: [],
   };
 }
 
-/** Stands in for the server: like check_rev in pages.py, a base_rev other than the current rev is a 409. */
+/**
+ * Stands in for the server: like check_rev in pages.py, a base_rev other than the current rev is a
+ * 409. Tagging pages leaves the rev as it is.
+ */
 function fakeServer(id: string, rev: number) {
   const server = { rev, pageIds: ["p1", "p2", "p3"], sent: [] as Body[] };
   vi.stubGlobal(
@@ -46,7 +66,7 @@ function fakeServer(id: string, rev: number) {
       if (body.base_rev != null && body.base_rev !== server.rev) {
         return reply(409, { error: { code: "stale_rev", message: "This notebook was changed somewhere else." } });
       }
-      server.rev += 1;
+      if (!url.endsWith("/pages/tags")) server.rev += 1;
       if (url.endsWith("/pages/order")) server.pageIds = body.page_ids as string[];
       return reply(200, notebook(id, server.rev, server.pageIds));
     }),
@@ -177,6 +197,51 @@ describe("notebook edits", () => {
     leave();
     // The reload left before the drag, so it would bring back the order from before it.
     expect(shown.slice(shown.indexOf("p3,p1,p2"))).toEqual(["p3,p1,p2"]);
+  });
+});
+
+describe("tagging pages", () => {
+  it("sends only the changes asked for, and no rev", async () => {
+    const nb = notebook("nb-tags", 3);
+    const server = fakeServer(nb.id, 3);
+    await tagPages(nb.id, ["p1", "p2"], { date: null, addClasses: ["c1"] });
+    await tagPages(nb.id, ["p3"], { addClasses: [], removeClasses: ["c2"] });
+    await tagPages(nb.id, ["p3"], { date: "2026-03-05" });
+    expect(server.sent).toEqual([
+      { page_ids: ["p1", "p2"], date: null, add_classes: ["c1"] },
+      { page_ids: ["p3"], remove_classes: ["c2"] },
+      { page_ids: ["p3"], date: "2026-03-05" },
+    ]);
+    expect(server.rev).toBe(3);
+    expect(queryClient.getQueryData<NotebookDetail>(["notebook", nb.id])?.rev).toBe(3);
+  });
+
+  it("waits for the notebook's other edits without upsetting their revs", async () => {
+    const nb = notebook("nb-tags-queued", 1);
+    const server = fakeServer(nb.id, 1);
+    queryClient.setQueryData(["notebook", nb.id], nb);
+    // Rotate, tag and rotate again, each before the response to the one before.
+    await Promise.all([
+      rotatePages(nb, ["p1"], 90),
+      tagPages(nb.id, ["p1"], { date: "2026-03-05" }),
+      rotatePages(nb, ["p2"], 90),
+    ]);
+    expect(server.sent.map((body) => body.base_rev)).toEqual([1, undefined, 2]);
+    expect(server.rev).toBe(3);
+  });
+
+  it("doesn't take a change made somewhere else for its own", async () => {
+    const nb = notebook("nb-tags-elsewhere", 1);
+    queryClient.setQueryData(["notebook", nb.id], nb);
+    const server = fakeServer(nb.id, 2); // another device has changed it since
+    // Tag, then rotate from the rev the page showed before the tag's response.
+    const results = await Promise.allSettled([
+      tagPages(nb.id, ["p1"], { date: "2026-03-05" }),
+      rotatePages(nb, ["p1"], 90),
+    ]);
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
+    expect(server.sent.map((body) => body.base_rev)).toEqual([undefined, 1]);
+    expect(server.rev).toBe(2);
   });
 });
 

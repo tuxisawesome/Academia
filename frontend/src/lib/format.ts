@@ -36,6 +36,30 @@ export function formatDate(iso: string | null | undefined): string {
   return dateFmt.format(date);
 }
 
+/** The dates a page can be tagged with (the server's limits). */
+export const FIRST_DAY = "1900-01-01";
+export const LAST_DAY = "2200-12-31";
+
+/**
+ * Whether `value` is a date tags can have ("2026-03-05", FIRST_DAY to LAST_DAY). A date input
+ * goes through years like 0002 and 0020 while a year is typed into it.
+ */
+export function isTagDay(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match || value < FIRST_DAY || value > LAST_DAY) return false;
+  const [y, m, d] = match.slice(1).map(Number);
+  const date = new Date(Date.UTC(y, m - 1, d));
+  return date.getUTCMonth() === m - 1 && date.getUTCDate() === d;
+}
+
+const shortDayFmt = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
+
+/** A calendar date as tags store it ("2026-03-05"), for display; `short` leaves out the year. */
+export function formatDay(day: string, short = false): string {
+  const [y, m, d] = day.split("-").map(Number);
+  return (short ? shortDayFmt : dateFmt).format(new Date(y, m - 1, d));
+}
+
 export function formatDateLong(iso: string | null | undefined): string {
   if (!iso) return "—";
   return fullFmt.format(new Date(iso));

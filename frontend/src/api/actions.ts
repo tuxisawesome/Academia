@@ -3,6 +3,7 @@ import { api, ApiError, downloadUrl } from "./client";
 import { invalidateLibrary, queryClient } from "./queries";
 import type {
   BookmarkDetail,
+  ClassItem,
   FolderColor,
   LibraryNode,
   NotebookDetail,
@@ -190,12 +191,13 @@ function afterOwnEdits(id: string, rev: number): number {
  * past the edits this client has made since, so only changes made elsewhere conflict. The
  * result is shown once no later edit of the notebook is waiting. If the edit fails, reloads the
  * notebook (it may have been shown optimistically) and rethrows; on a stale-revision conflict
- * the reload finishes first.
+ * the reload finishes first. An edit that leaves the rev as it is (tags) passes `bumpsRev: false`.
  */
 function notebookEdit(
   id: string,
   baseRev: number | null,
   run: (rev: number | null) => Promise<NotebookDetail>,
+  bumpsRev = true,
 ): Promise<NotebookDetail> {
   const edit = (pendingEdits.get(id) ?? Promise.resolve())
     .catch(() => undefined)
@@ -207,8 +209,9 @@ function notebookEdit(
       const from = rev ?? (shown === undefined ? undefined : afterOwnEdits(id, shown));
       try {
         const detail = await run(rev);
-        // One step up means nothing else changed the notebook in between.
-        if (from !== undefined && detail.rev === from + 1) {
+        // One step up means nothing else changed the notebook in between (for an edit that
+        // doesn't change the rev, it means something else did).
+        if (bumpsRev && from !== undefined && detail.rev === from + 1) {
           if (!ownEdits.has(id)) ownEdits.set(id, new Map());
           ownEdits.get(id)!.set(from, detail.rev);
         }
@@ -288,6 +291,94 @@ export function undeletePages(notebookId: string, batch: string) {
   return notebookEdit(notebookId, null, () =>
     api<NotebookDetail>(`/notebooks/${notebookId}/pages/undelete`, { method: "POST", json: { batch } }),
   );
+}
+
+/** A tag change for a set of pages: only what is given changes (`date: null` clears the date). */
+export interface TagChanges {
+  date?: string | null;
+  addClasses?: string[];
+  removeClasses?: string[];
+}
+
+/**
+ * Tags pages of a notebook (also how a bookmark's pages are tagged). Tags are not part of the
+ * PDF, so no rev is sent and none is produced, but it waits for the notebook's other edits.
+ */
+export function tagPages(notebookId: string, pageIds: string[], changes: TagChanges) {
+  const json: Record<string, unknown> = { page_ids: pageIds };
+  if (changes.date !== undefined) json.date = changes.date;
+  if (changes.addClasses?.length) json.add_classes = changes.addClasses;
+  if (changes.removeClasses?.length) json.remove_classes = changes.removeClasses;
+  return notebookEdit(
+    notebookId,
+    null,
+    () => api<NotebookDetail>(`/notebooks/${notebookId}/pages/tags`, { method: "POST", json }),
+    false,
+  );
+}
+
+// ---- classes ---------------------------------------------------------------------------
+
+/** Shows a new or changed class at once (a picker selects a class it just created), then reloads them all. */
+function storeClass(item: ClassItem): Promise<void> {
+  queryClient.setQueryData<ClassItem[]>(["classes"], (old) =>
+    old && (old.some((c) => c.id === item.id) ? old.map((c) => (c.id === item.id ? item : c)) : [...old, item]),
+  );
+  return queryClient.invalidateQueries({ queryKey: ["classes"] });
+}
+
+export async function createClass(name: string, color?: FolderColor | null) {
+  const item = await api<ClassItem>("/classes", { method: "POST", json: { name, color: color ?? null } });
+  await storeClass(item);
+  return item;
+}
+
+/** Renames a class or changes its color (`color: null` removes it). */
+export async function updateClass(id: string, patch: { name?: string; color?: FolderColor | null }) {
+  const json: Record<string, unknown> = {};
+  if (patch.name !== undefined) json.name = patch.name;
+  if (patch.color === null) json.clear_color = true;
+  else if (patch.color !== undefined) json.color = patch.color;
+  const item = await api<ClassItem>(`/classes/${id}`, { method: "PATCH", json });
+  await storeClass(item);
+  return item;
+}
+
+/** Deletes a class; every page tagged with it loses the tag. */
+export async function deleteClass(id: string) {
+  try {
+    await api(`/classes/${id}`, { method: "DELETE" });
+  } finally {
+    // The pages on screen (notebooks, bookmarks, search results) drop the class too.
+    await invalidateLibrary();
+  }
+}
+
+// A class moved up a few times in a row: each order is saved after the one before, so the server
+// can't end up with an earlier one.
+let savingOrder: Promise<unknown> = Promise.resolve();
+
+export async function reorderClasses(ids: string[]) {
+  const previous = queryClient.getQueryData<ClassItem[]>(["classes"]);
+  if (previous) {
+    queryClient.setQueryData(
+      ["classes"],
+      ids.map((id) => previous.find((c) => c.id === id)).filter((c): c is ClassItem => !!c),
+    );
+  }
+  const save = savingOrder
+    .catch(() => undefined)
+    .then(() => api<ClassItem[]>("/classes/order", { method: "PUT", json: { class_ids: ids } }));
+  savingOrder = save;
+  try {
+    const classes = await save;
+    // A later order is shown already.
+    if (savingOrder === save) queryClient.setQueryData(["classes"], classes);
+    return classes;
+  } catch (err) {
+    void queryClient.invalidateQueries({ queryKey: ["classes"] });
+    throw err;
+  }
 }
 
 // ---- bookmarks -----------------------------------------------------------------------

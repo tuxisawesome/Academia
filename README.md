@@ -12,6 +12,10 @@ A self-hosted library for PDFs, with **Notebooks** and **Bookmarks** kept in fol
   - You can edit a bookmark's pages later.
   - Downloading a bookmark gives a PDF of just its pages, labelled with their original page numbers.
 - **Pinned folders**: pin folders to the top of the sidebar (right-click → *Pin to sidebar*, or drag a folder onto *Pinned*). Reorder them by dragging.
+- **Class and date tags** on pages: each page can have a date and any number of classes.
+  - Keep your class list in Settings → Classes (names, colors, order); pick classes from a searchable dropdown, which can also add a new one.
+  - Tag selected pages in a notebook (*Tag pages* button, right-click, or `t`), all pages of a bookmark (its right-click menu or the notebook's bookmarks panel), or the pages on screen in the reader.
+  - Tags show on page thumbnails and in the reader, and Search can filter by class and date range, with or without search words.
 - **Search** with two collapsible sections:
   - **Files**: folders, notebooks and bookmarks whose names match.
   - **Contents**: the pages whose text matches, shown as page thumbnails that open the reader on that page.
@@ -242,6 +246,7 @@ cd frontend && npm run build && npm run e2e   # Playwright end-to-end tests (use
 - PDF work runs in a separate process pool.
 - Uploaded PDFs are stored once and never modified.
 - A notebook is an ordered list of page references into them. A bookmark is a set of those page ids, which is why it follows its pages through moves, inserts and reordering.
+- Tags (a date and any number of the user's classes) are stored on those page references, so a page tagged through a bookmark is tagged in its notebook too. They are not part of the PDFs: tagging leaves generated PDFs alone.
 - Generated PDFs are cached under a hash of their contents.
 - Each uploaded PDF's text layer is extracted in the background and stored per page in a SQLite FTS5 index, which powers the Contents half of search.
 

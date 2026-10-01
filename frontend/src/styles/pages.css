@@ -314,6 +314,22 @@
   clip-path: polygon(0 0, 100% 0, 100% 100%, 50% 75%, 0 100%);
 }
 
+/* Over the bottom of the page, on a background of its own to stay legible on any page. */
+.pg-tags {
+  position: absolute;
+  left: 8px;
+  bottom: 8px;
+  max-width: calc(100% - 16px);
+  padding: 1px 6px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-sm);
+  color: var(--ink);
+  font-size: 11.5px;
+  overflow: hidden;
+}
+
 .pg-check {
   position: absolute;
   top: 8px;
@@ -896,6 +912,16 @@
 .page-indicator {
   white-space: nowrap;
   min-width: 120px;
+}
+
+.reader-tags {
+  flex: 0 1 auto;
+  font-size: 13px;
+  overflow: hidden;
+}
+
+.reader-tags .tag-class {
+  max-width: 160px;
 }
 
 .scrubber {

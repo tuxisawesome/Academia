@@ -3,12 +3,14 @@ import { api, ApiError, setSessionEndedHandler } from "./client";
 import type {
   AdminUser,
   BookmarkDetail,
+  ClassItem,
   ExportJob,
   FolderListing,
   LibraryNode,
   NotebookDetail,
   PinnedFolder,
   Progress,
+  SearchFilters,
   SearchResults,
   TreeFolder,
   User,
@@ -73,7 +75,19 @@ queryClient.getQueryCache().subscribe((event) => {
   for (const listener of sessionEndListeners) listener();
 });
 
-export const LIBRARY_KEYS = ["nodes", "tree", "trash", "search", "notebooks", "node", "bookmark", "notebook", "pins"];
+// "classes" too: their page counts follow pages and notebooks coming and going.
+export const LIBRARY_KEYS = [
+  "nodes",
+  "tree",
+  "trash",
+  "search",
+  "notebooks",
+  "node",
+  "bookmark",
+  "notebook",
+  "pins",
+  "classes",
+];
 
 export function invalidateLibrary(): Promise<void> {
   return Promise.all(LIBRARY_KEYS.map((key) => queryClient.invalidateQueries({ queryKey: [key] }))).then(
@@ -147,13 +161,33 @@ export function useTrash() {
   return useQuery({ queryKey: ["trash"], queryFn: () => api<LibraryNode[]>("/trash") });
 }
 
-export function useSearch(q: string, folderId: string | null) {
+const NO_FILTERS: SearchFilters = { classes: [], from: null, to: null };
+
+/** Searches by text, tag filters or both; with neither there is nothing to search for. */
+export function useSearch(q: string, folderId: string | null, filters: SearchFilters = NO_FILTERS) {
+  const filtered = filters.classes.length > 0 || !!filters.from || !!filters.to;
   return useQuery({
-    queryKey: ["search", q, folderId ?? "root"],
-    queryFn: () => api<SearchResults>("/search", { query: { q, in: folderId } }),
-    enabled: q.trim().length > 0,
+    queryKey: ["search", q, folderId ?? "root", filters],
+    queryFn: () =>
+      api<SearchResults>("/search", {
+        query: { q, in: folderId, class: filters.classes, from: filters.from, to: filters.to },
+      }),
+    enabled: q.trim().length > 0 || filtered,
     placeholderData: (previous) => previous,
   });
+}
+
+const classesQuery = { queryKey: ["classes"], queryFn: () => api<ClassItem[]>("/classes"), staleTime: 60_000 };
+const byId = (classes: ClassItem[]) => new Map(classes.map((c) => [c.id, c]));
+
+/** The user's classes, in their order (Settings → Classes). */
+export function useClasses() {
+  return useQuery(classesQuery);
+}
+
+/** The user's classes by id, to show the classes pages are tagged with (undefined while loading). */
+export function useClassMap(): Map<string, ClassItem> | undefined {
+  return useQuery({ ...classesQuery, select: byId }).data;
 }
 
 export function usePins() {

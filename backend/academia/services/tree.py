@@ -18,6 +18,7 @@ from ..models import (
     Node,
     Notebook,
     Page,
+    PageClass,
     new_id,
     utcnow,
 )
@@ -25,6 +26,7 @@ from .common import (
     FOLDER_COLORS,
     ancestor_ids,
     ancestors,
+    chunks,
     clean_name,
     descendant_ids,
     load_nodes,
@@ -201,6 +203,7 @@ def copy_nodes(db: Session, user_id: str, ids: list[str], target_id: str | None)
                     source_index=page.source_index,
                     rotation=page.rotation,
                     created_at=now,
+                    tag_date=page.tag_date,
                 )
                 db.add(new_page)
                 page_map[page.id] = new_page.id
@@ -236,6 +239,10 @@ def copy_nodes(db: Session, user_id: str, ids: list[str], target_id: str | None)
             db.flush()
             for pid in member_ids:
                 db.add(BookmarkPage(bookmark_id=copy.id, page_id=pid, notebook_id=bm.notebook_id))
+    # The copied pages keep their classes.
+    for part in chunks(list(page_map)):
+        tags = db.execute(select(PageClass.page_id, PageClass.class_id).where(PageClass.page_id.in_(part))).all()
+        db.add_all(PageClass(page_id=page_map[pid], class_id=cid) for pid, cid in tags)
     db.flush()
     return new_tops
 

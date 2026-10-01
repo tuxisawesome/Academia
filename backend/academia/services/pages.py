@@ -33,7 +33,7 @@ from ..models import (
     utcnow,
 )
 from .common import ancestors, chunks, clean_name, owned_folder_or_root, segments, segments_label
-from .describe import live_pages_with_sizes, node_base, page_json
+from .describe import live_pages_with_sizes, node_base, pages_json
 from .textindex import text_indexer
 from .tree import require_notebook
 
@@ -179,7 +179,7 @@ def notebook_detail(db: Session, user_id: str, notebook_id: str) -> dict[str, An
             "rev": nb.rev,
             "page_count": nb.page_count,
             "path": ancestors(db, node.id),
-            "pages": [page_json(p, sp) for p, sp in live_pages_with_sizes(db, node.id)],
+            "pages": pages_json(db, live_pages_with_sizes(db, node.id)),
             "bookmarks": notebook_bookmarks(db, node.id),
         }
     )

@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from ..errors import BadRequest, Conflict, NotFound
 from ..models import BOOKMARK, Bookmark, BookmarkPage, Node, Notebook, Page, utcnow
 from .common import ancestors, chunks, clean_name, owned_folder_or_root, owned_node, segments, segments_label
-from .describe import bookmark_members, node_base, page_json
+from .describe import bookmark_members, node_base, pages_json
 from .pages import live_page_ids
 from .tree import require_notebook
 
@@ -24,7 +24,7 @@ def require_bookmark(db: Session, user_id: str, node_id: str, allow_trashed: boo
     return node, bm
 
 
-def _validated_pages(db: Session, notebook_id: str, page_ids: Sequence[str]) -> list[str]:
+def validated_pages(db: Session, notebook_id: str, page_ids: Sequence[str]) -> list[str]:
     live = set(live_page_ids(db, notebook_id))
     wanted = list(dict.fromkeys(page_ids))
     missing = [pid for pid in wanted if pid not in live]
@@ -41,7 +41,7 @@ def create_bookmark(
 ) -> Node:
     parent = owned_folder_or_root(db, user_id, parent_id)
     nb_node, _nb = require_notebook(db, user_id, notebook_id)
-    wanted = _validated_pages(db, nb_node.id, page_ids)
+    wanted = validated_pages(db, nb_node.id, page_ids)
     node = Node(owner_id=user_id, parent_id=parent.id if parent else None, kind=BOOKMARK, name=clean_name(name))
     db.add(node)
     db.flush()
@@ -61,7 +61,7 @@ def set_bookmark_pages(
     nb_node = db.get(Node, bm.notebook_id)
     if nb_node is None or nb_node.trashed_at is not None:
         raise BadRequest("The notebook for this bookmark is in the Trash.", code="notebook_unavailable")
-    wanted = _validated_pages(db, bm.notebook_id, page_ids)
+    wanted = validated_pages(db, bm.notebook_id, page_ids)
     live = live_page_ids(db, bm.notebook_id)
     # Replace membership among live pages only; memberships of soft-deleted pages are kept
     # so undoing a page deletion restores them into this bookmark too.
@@ -75,7 +75,7 @@ def set_bookmark_pages(
 
 def add_pages_to_bookmark(db: Session, user_id: str, bookmark_id: str, page_ids: Sequence[str]) -> None:
     node, bm = require_bookmark(db, user_id, bookmark_id)
-    wanted = _validated_pages(db, bm.notebook_id, page_ids)
+    wanted = validated_pages(db, bm.notebook_id, page_ids)
     existing = set(db.scalars(select(BookmarkPage.page_id).where(BookmarkPage.bookmark_id == node.id)))
     db.add_all(
         BookmarkPage(bookmark_id=node.id, page_id=pid, notebook_id=bm.notebook_id)
@@ -107,7 +107,10 @@ def bookmark_detail(db: Session, user_id: str, bookmark_id: str) -> dict[str, An
             },
             "available": bool(nb_node is not None and nb_node.trashed_at is None),
             "page_ids": [p.id for p, _ in members],
-            "pages": [{**page_json(p, sp), "number": (p.position or 0) + 1} for p, sp in members],
+            "pages": [
+                {**item, "number": (p.position or 0) + 1}
+                for item, (p, _) in zip(pages_json(db, members), members, strict=True)
+            ],
             "segments": runs,
             "label": segments_label(runs),
         }

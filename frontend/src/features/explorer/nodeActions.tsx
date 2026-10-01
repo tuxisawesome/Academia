@@ -22,6 +22,7 @@ import {
   PinOff,
   ArrowDownAZ,
   Scissors,
+  Tag,
   Trash2,
   Upload,
   FileSearch,
@@ -43,9 +44,9 @@ import {
   unpinFolders,
   updatePrefs,
 } from "../../api/actions";
-import { ApiError } from "../../api/client";
-import { useMe, usePins } from "../../api/queries";
-import type { FolderColor, LibraryNode, Prefs, SortKey } from "../../api/types";
+import { api, ApiError } from "../../api/client";
+import { queryClient, useMe, usePins } from "../../api/queries";
+import type { BookmarkDetail, FolderColor, LibraryNode, Prefs, SortKey } from "../../api/types";
 import type { MenuEntry } from "../../components/Menu";
 import { plural } from "../../lib/format";
 import { groupByParent } from "../../lib/parents";
@@ -53,6 +54,7 @@ import { useClipboard } from "../../state/clipboard";
 import { confirmDialog, promptDialog } from "../../state/dialogs";
 import { toast, toastError } from "../../state/toasts";
 import { uploadAsNotebooks } from "../../state/uploads";
+import { TagPagesDialog, type TagTarget } from "../tags/TagPagesDialog";
 import { ChooseNotebookDialog, MoveDialog, PropertiesDialog } from "./dialogs";
 
 export function uniqueName(base: string, existing: string[]): string {
@@ -103,6 +105,7 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
   const [moveTargets, setMoveTargets] = useState<LibraryNode[] | null>(null);
   const [propsNode, setPropsNode] = useState<LibraryNode | null>(null);
   const [choosingNotebook, setChoosingNotebook] = useState(false);
+  const [tagTarget, setTagTarget] = useState<TagTarget | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const uploadTarget = useRef<string | null>(null);
   const trashing = useRef(new Set<string>());
@@ -252,6 +255,25 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
 
   const download = (node: LibraryNode) => safeDownload(node).catch(toastError);
 
+  /** Tags a bookmark's pages, in its notebook. Loads the bookmark first: the listing lacks its pages. */
+  const tagBookmarkPages = async (node: LibraryNode) => {
+    try {
+      const bm = await api<BookmarkDetail>(`/bookmarks/${node.id}`);
+      queryClient.setQueryData(["bookmark", bm.id], bm);
+      if (!bm.available) toast("This bookmark's notebook is in the Trash. Restore it to tag its pages.");
+      else if (!bm.pages.length) toast("This bookmark has no pages.");
+      else {
+        setTagTarget({
+          notebookId: bm.notebook.id,
+          pages: bm.pages,
+          description: `The pages of the bookmark “${bm.name}”: ${bm.label} of “${bm.notebook.name}”.`,
+        });
+      }
+    } catch (err) {
+      toastError(err);
+    }
+  };
+
   const pinEntry = (folders: LibraryNode[]): MenuEntry => {
     const ids = folders.map((f) => f.id);
     const allPinned = ids.every((id) => pinnedIds.has(id));
@@ -297,6 +319,12 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
       entries.push(
         { label: "Read", icon: <BookOpen />, onSelect: () => read(single), disabled: !usable || !single.page_count },
         { label: "Edit pages", icon: <Pencil />, onSelect: () => navigate(`/b/${single.id}/edit`), disabled: !usable },
+        {
+          label: "Tag pages…",
+          icon: <Tag />,
+          onSelect: () => void tagBookmarkPages(single),
+          disabled: !usable || !single.page_count,
+        },
         {
           label: "Open notebook",
           icon: <NotebookPen />,
@@ -422,6 +450,7 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
         }}
       />
       <PropertiesDialog node={propsNode} onClose={() => setPropsNode(null)} />
+      <TagPagesDialog target={tagTarget} onClose={() => setTagTarget(null)} />
       <ChooseNotebookDialog
         open={choosingNotebook}
         onClose={() => setChoosingNotebook(false)}

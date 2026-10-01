@@ -11,7 +11,9 @@ from pydantic import BaseModel, Field
 from ..db import read_session
 from ..errors import Conflict
 from ..services import bookmarks as bm_service
+from ..services import classes as classes_service
 from ..services import pages as pages_service
+from ..services.classes import MAX_CLASSES
 from ..services.describe import describe_nodes
 from ..services.export import safe_filename
 from ..services.pdfbuild import bookmark_spec, ensure_pdf, notebook_spec, spec_digest
@@ -56,6 +58,14 @@ class RotateBody(PagesBody):
 
 class UndeleteBody(BaseModel):
     batch: str
+
+
+class TagBody(BaseModel):
+    page_ids: list[str] = Field(min_length=1, max_length=5000)
+    # Left out: each page keeps its date; null clears it.
+    date: str | None = Field(default=None, max_length=32)
+    add_classes: list[str] = Field(default_factory=list, max_length=MAX_CLASSES)
+    remove_classes: list[str] = Field(default_factory=list, max_length=MAX_CLASSES)
 
 
 class BookmarkBody(BaseModel):
@@ -175,6 +185,21 @@ def delete_pages(notebook_id: str, body: PagesBody, user: CurrentUser, db: Db) -
 @router.post("/notebooks/{notebook_id}/pages/undelete")
 def undelete_pages(notebook_id: str, body: UndeleteBody, user: CurrentUser, db: Db) -> dict[str, Any]:
     pages_service.undelete(db, user.id, notebook_id, body.batch)
+    return _detail_after(db, user.id, notebook_id)
+
+
+@router.post("/notebooks/{notebook_id}/pages/tags")
+def tag_pages(notebook_id: str, body: TagBody, user: CurrentUser, db: Db) -> dict[str, Any]:
+    classes_service.tag_pages(
+        db,
+        user.id,
+        notebook_id,
+        body.page_ids,
+        set_date="date" in body.model_fields_set,
+        day=classes_service.parse_date(body.date) if body.date is not None else None,
+        add_classes=body.add_classes,
+        remove_classes=body.remove_classes,
+    )
     return _detail_after(db, user.id, notebook_id)
 
 

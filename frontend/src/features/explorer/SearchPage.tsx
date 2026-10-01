@@ -1,16 +1,19 @@
 import { ContextMenu } from "radix-ui";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useSearchParams } from "react-router";
 import { ChevronRight, FileText, Folder, Search, X } from "lucide-react";
 import { renameNode } from "../../api/actions";
 import { errorMessage } from "../../api/client";
-import { useSearch } from "../../api/queries";
-import type { ContentResult, LibraryNode } from "../../api/types";
+import { useClasses, useClassMap, useSearch } from "../../api/queries";
+import type { ClassItem, ContentResult, LibraryNode, SearchFilters } from "../../api/types";
+import { ClassChip, ClassPicker } from "../../components/ClassPicker";
 import { NodeGlyph } from "../../components/Glyphs";
 import { ContextMenuContent } from "../../components/Menu";
+import { PageTags } from "../../components/PageTags";
 import { PageThumb } from "../../components/PageThumb";
-import { plural } from "../../lib/format";
+import { FIRST_DAY, formatDay, isTagDay, LAST_DAY, plural } from "../../lib/format";
 import { useDocumentTitle, useIsCoarse, useLongPressMenu } from "../../lib/hooks";
+import { filtersFromParams, hasFilters, withFilters } from "../../lib/searchFilters";
 import { useClipboard } from "../../state/clipboard";
 import { toastError } from "../../state/toasts";
 import { focusRenameInput, ListView } from "./ItemViews";
@@ -65,7 +68,15 @@ function Section({
   );
 }
 
-function ContentHit({ item, onMenu }: { item: ContentResult; onMenu: (node: LibraryNode) => void }) {
+function ContentHit({
+  item,
+  classes,
+  onMenu,
+}: {
+  item: ContentResult;
+  classes: Map<string, ClassItem> | undefined;
+  onMenu: (node: LibraryNode) => void;
+}) {
   const navigate = useNavigate();
   const kind = item.kind === "bookmark" ? "b" : "n";
   const openItem = () => navigate(item.kind === "bookmark" ? `/read/b/${item.id}` : `/n/${item.id}`);
@@ -91,6 +102,7 @@ function ContentHit({ item, onMenu }: { item: ContentResult; onMenu: (node: Libr
           >
             <PageThumb page={m} boxWidth={78} boxHeight={100} />
             <span className="tabular">p. {m.number}</span>
+            <PageTags pages={[m]} classes={classes} compact />
           </button>
         ))}
         {more > 0 && <span className="hit-more tabular">+{more} more</span>}
@@ -99,12 +111,122 @@ function ContentHit({ item, onMenu }: { item: ContentResult; onMenu: (node: Libr
   );
 }
 
+function dateRangeLabel({ from, to }: SearchFilters): string {
+  if (from && to) return `${formatDay(from)} – ${formatDay(to)}`;
+  return from ? `From ${formatDay(from)}` : `Until ${formatDay(to!)}`;
+}
+
+/**
+ * A From or To date of the filters. What is typed is kept here until it is a whole date tags can
+ * have: typing a year goes through 0002, 0020 and 0202, which aren't searched for.
+ */
+function DayFilter({
+  label,
+  value,
+  min = FIRST_DAY,
+  max = LAST_DAY,
+  onChange,
+}: {
+  label: string;
+  value: string | null;
+  min?: string;
+  max?: string;
+  onChange: (day: string | null) => void;
+}) {
+  const [text, setText] = useState(value ?? "");
+  // A filter changed elsewhere (its chip removed, Back) shows here.
+  const [shown, setShown] = useState(value);
+  if (shown !== value) {
+    setShown(value);
+    setText(value ?? "");
+  }
+  return (
+    <label className="filter-day">
+      <span>{label}</span>
+      <input
+        type="date"
+        className="input"
+        min={min}
+        max={max}
+        value={text}
+        onChange={(e) => {
+          const day = e.target.value;
+          setText(day);
+          // Empty while a date is only partly typed: the filter is set once it is whole.
+          if (!day) onChange(null);
+          else if (isTagDay(day)) onChange(day);
+        }}
+      />
+    </label>
+  );
+}
+
+/** Filters pages by class and date; the filters are kept in the URL. */
+function FilterBar({ filters, onChange }: { filters: SearchFilters; onChange: (filters: SearchFilters) => void }) {
+  const classes = useClassMap();
+  const chosen = filters.classes.map((id) => classes?.get(id)).filter((c): c is ClassItem => !!c);
+  return (
+    <div className="search-filters" role="group" aria-label="Filters">
+      <div className="filter-classes">
+        <ClassPicker
+          label="Filter by class"
+          placeholder="Filter by class…"
+          chips={false}
+          allowCreate={false}
+          value={filters.classes}
+          onChange={(ids) => onChange({ ...filters, classes: ids })}
+        />
+      </div>
+      <DayFilter
+        label="From"
+        value={filters.from}
+        max={filters.to ?? LAST_DAY}
+        onChange={(from) => onChange({ ...filters, from })}
+      />
+      <DayFilter
+        label="To"
+        value={filters.to}
+        min={filters.from ?? FIRST_DAY}
+        onChange={(to) => onChange({ ...filters, to })}
+      />
+      {hasFilters(filters) && (
+        <div className="chips filter-chips" role="group" aria-label="Active filters">
+          {chosen.map((c) => (
+            <ClassChip
+              key={c.id}
+              item={c}
+              onRemove={() => onChange({ ...filters, classes: filters.classes.filter((id) => id !== c.id) })}
+            />
+          ))}
+          {(filters.from || filters.to) && (
+            <span className="chip tabular">
+              {dateRangeLabel(filters)}
+              <button aria-label="Remove the date filter" onClick={() => onChange({ ...filters, from: null, to: null })}>
+                <X />
+              </button>
+            </span>
+          )}
+          <button className="btn btn-sm btn-ghost" onClick={() => onChange({ classes: [], from: null, to: null })}>
+            Clear filters
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function SearchPage() {
   const [params, setParams] = useSearchParams();
   const q = params.get("q") ?? "";
   const scopeId = params.get("in");
+  const filters = useMemo(() => filtersFromParams(params), [params]);
+  const filtered = hasFilters(filters);
+  // Something to search for: words, filters or both.
+  const searching = !!q || filtered;
   useDocumentTitle(q ? `Search: ${q}` : "Search");
-  const { data, error, isFetching } = useSearch(q, scopeId);
+  const { data, error, isFetching } = useSearch(q, scopeId, filters);
+  const { data: allClasses, refetch: refetchClasses } = useClasses();
+  const classes = useClassMap();
   const coarse = useIsCoarse();
   const clipboard = useClipboard();
   const [open, setOpen] = useState(loadSections);
@@ -125,7 +247,7 @@ export function SearchPage() {
 
   // A rename belongs to the results it was started in: a new query or scope cancels it before the
   // new results render (a rename box appearing there would take the focus from the search box).
-  const resultsKey = `${scopeId ?? ""}/${q}`;
+  const resultsKey = params.toString();
   const [renamingIn, setRenamingIn] = useState(resultsKey);
   if (renamingIn !== resultsKey) {
     setRenamingIn(resultsKey);
@@ -141,6 +263,27 @@ export function SearchPage() {
       /* ignore */
     }
   };
+
+  const setFilters = (next: SearchFilters) => setParams(withFilters(params, next), { replace: true });
+
+  // A filter by a class deleted since (an old link, another tab) would fail the whole search. A
+  // class missing from the list may also be new (made in another tab): reload the list to be sure.
+  useEffect(() => {
+    const unknown = (list: ClassItem[]) => filters.classes.filter((id) => !list.some((c) => c.id === id));
+    if (!allClasses || !unknown(allClasses).length) return;
+    let cancelled = false;
+    void refetchClasses().then(({ data: fresh, isError }) => {
+      if (cancelled || !fresh || isError) return;
+      const gone = unknown(fresh);
+      if (gone.length) {
+        const kept = filters.classes.filter((id) => !gone.includes(id));
+        setParams(withFilters(params, { ...filters, classes: kept }), { replace: true });
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [allClasses, refetchClasses, filters, params, setParams]);
 
   const searchEverywhere = () => {
     const next = new URLSearchParams(params);
@@ -171,9 +314,9 @@ export function SearchPage() {
     <div className="explorer">
       <div className="explorer-bar search-bar">
         <h2 className="bar-title">
-          <Search size={20} /> {q ? <>Results for “{q}”</> : "Search"}
+          <Search size={20} /> {q ? <>Results for “{q}”</> : filtered ? "Tagged pages" : "Search"}
         </h2>
-        {q && (
+        {searching && (
           <span className="scope-chip">
             {scopeId ? (
               <>
@@ -192,6 +335,7 @@ export function SearchPage() {
           </span>
         )}
       </div>
+      <FilterBar filters={filters} onChange={setFilters} />
       <ContextMenu.Root onOpenChange={longPress.onOpenChange}>
         <ContextMenu.Trigger asChild>
           <div
@@ -204,13 +348,17 @@ export function SearchPage() {
               if (!targetMenuAt(e.target as HTMLElement)) e.preventDefault();
             }}
           >
-            {!q ? (
+            {!searching ? (
               <div className="center-fill">
                 <div className="empty">
                   <h3>Search your library</h3>
                   <p>
                     Type in the search box above. Searching inside a folder looks through that folder and everything in
                     it; from the Library it looks everywhere.
+                  </p>
+                  <p>
+                    To find pages by their tags, choose a class or dates above: with no words typed, every page tagged
+                    that way is listed.
                   </p>
                 </div>
               </div>
@@ -232,7 +380,13 @@ export function SearchPage() {
                   busy={isFetching}
                 >
                   {files.length === 0 ? (
-                    <p className="muted section-empty">No folders, notebooks or bookmarks are named like “{q}”.</p>
+                    <p className="muted section-empty">
+                      {!filtered
+                        ? `No folders, notebooks or bookmarks are named like “${q}”.`
+                        : q
+                          ? `No notebooks or bookmarks named like “${q}” have pages that match the filters.`
+                          : "No notebooks or bookmarks have pages that match the filters."}
+                    </p>
                   ) : (
                     <ListView
                       items={files}
@@ -263,13 +417,23 @@ export function SearchPage() {
                 >
                   {contents.length === 0 ? (
                     <p className="muted section-empty">
-                      No pages mention “{q}”. Only text that can be selected in a PDF is searched; scanned or handwritten
-                      pages aren’t.
+                      {filtered
+                        ? q
+                          ? `No pages that match the filters mention “${q}”.`
+                          : "No pages match the filters."
+                        : `No pages mention “${q}”.`}{" "}
+                      {q &&
+                        "Only text that can be selected in a PDF is searched; scanned or handwritten pages aren’t."}
                     </p>
                   ) : (
                     <div className="content-hits">
                       {contents.map((item) => (
-                        <ContentHit key={item.id} item={item} onMenu={(node) => setMenuTargets([node])} />
+                        <ContentHit
+                          key={item.id}
+                          item={item}
+                          classes={classes}
+                          onMenu={(node) => setMenuTargets([node])}
+                        />
                       ))}
                     </div>
                   )}

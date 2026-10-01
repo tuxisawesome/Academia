@@ -19,7 +19,8 @@ export interface RequestOptions {
   body?: BodyInit;
   headers?: Record<string, string>;
   signal?: AbortSignal;
-  query?: Record<string, string | number | boolean | null | undefined>;
+  /** Query parameters; a list is sent as the parameter repeated once per value. */
+  query?: Record<string, string | number | boolean | string[] | null | undefined>;
   /** Lets the request finish after the page is closed. */
   keepalive?: boolean;
 }
@@ -27,7 +28,8 @@ export interface RequestOptions {
 export function apiUrl(path: string, query?: RequestOptions["query"]): string {
   const url = new URL(`/api${path}`, window.location.origin);
   for (const [key, value] of Object.entries(query ?? {})) {
-    if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
+    if (Array.isArray(value)) for (const item of value) url.searchParams.append(key, item);
+    else if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   }
   return url.pathname + url.search;
 }
