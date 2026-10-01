@@ -17,7 +17,7 @@ target_metadata = Base.metadata
 
 
 # Full-text search tables are created with raw SQL (FTS5); Alembic must not try to manage them.
-UNMANAGED_PREFIXES = ("page_text_fts", "page_text_vocab")
+UNMANAGED_PREFIXES = ("page_text_fts",)
 
 
 def include_name(name, type_, parent_names):  # noqa: ANN001, ANN201

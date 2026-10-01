@@ -10,8 +10,6 @@ import { useIsNarrow } from "../lib/hooks";
 import { toastError } from "../state/toasts";
 import { FolderTree } from "./FolderTree";
 import { PinnedFolders } from "./PinnedFolders";
-import { startRecognition } from "../features/recognition";
-import { RecognitionStatus } from "../features/recognition/RecognitionStatus";
 
 /** The folder the search box applies to: the open folder, or the scope of the current search. */
 function useSearchScope(): { id: string; name: string } | null {
@@ -88,7 +86,6 @@ export function AppShell() {
   const [drawerOpen, setDrawerOpen] = useState(false);
 
   useEffect(() => setDrawerOpen(false), [location.pathname]);
-  useEffect(() => startRecognition(), []);
 
   if (!me) return null;
   const theme = me.prefs.theme;
@@ -161,7 +158,6 @@ export function AppShell() {
           <FolderTree />
         </nav>
         <div className="sidebar-foot">
-          <RecognitionStatus />
           <NavLink to="/trash" className="side-link">
             <Trash2 /> Trash
           </NavLink>

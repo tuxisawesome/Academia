@@ -833,25 +833,10 @@
   color: var(--ink);
 }
 
-.hit-page.approx .thumb-paper {
-  outline: 1px dashed var(--gold);
-  outline-offset: 2px;
-}
-
 .hit-more {
   align-self: center;
   padding: 0 8px;
   color: var(--ink-faint);
   font-size: 13px;
   white-space: nowrap;
-}
-
-.reading-note {
-  margin: 12px 4px 0;
-  padding: 10px 12px;
-  border-left: 3px solid var(--gold);
-  border-radius: 0 var(--radius) var(--radius) 0;
-  background: var(--gold-soft);
-  color: var(--ink-muted);
-  font-size: 14px;
 }

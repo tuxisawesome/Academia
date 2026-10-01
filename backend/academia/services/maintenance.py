@@ -16,7 +16,6 @@ from ..db import write_session
 from ..models import Job, Page, Session, Source, utcnow
 from ..storage import data_dir, pdf_cache_dir, remove_source_files, tmp_dir
 from .common import chunks
-from .modelfiles import prune_models
 from .trash import mark_orphans, purge_expired
 
 log = logging.getLogger(__name__)
@@ -135,7 +134,6 @@ def run_maintenance() -> dict[str, Any]:
     stats["exports_expired"] = expire_exports(now)
     stats["sessions_expired"] = expire_sessions(now)
     stats["tmp_files_removed"] = clean_tmp()
-    stats["old_model_revisions_removed"] = prune_models()
     log.info("Maintenance: %s", stats)
     return stats
 

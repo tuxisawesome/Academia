@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { NavLink, useNavigate, useParams } from "react-router";
-import { Archive, Download, Info, LogOut, Palette, ScanText, UserRound } from "lucide-react";
+import { Archive, Download, Info, LogOut, Palette, UserRound } from "lucide-react";
 import { logout, updatePrefs } from "../../api/actions";
 import { api, downloadUrl, errorMessage } from "../../api/client";
 import { queryClient, useExports, useMe } from "../../api/queries";
@@ -11,12 +11,10 @@ import { formatBytes, formatDate } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
 import { toast, toastError } from "../../state/toasts";
 import { PasswordForm } from "../auth/PasswordForm";
-import { RecognitionSettings } from "../recognition/RecognitionSettings";
 
 const SECTIONS = [
   { key: "appearance", label: "Appearance", icon: <Palette /> },
   { key: "account", label: "Account", icon: <UserRound /> },
-  { key: "recognition", label: "Text recognition", icon: <ScanText /> },
   { key: "export", label: "Export", icon: <Archive /> },
   { key: "about", label: "About", icon: <Info /> },
 ] as const;
@@ -44,7 +42,6 @@ export function SettingsPage() {
           <div className="settings-body">
             {current === "appearance" && <AppearanceSettings />}
             {current === "account" && <AccountSettings />}
-            {current === "recognition" && <RecognitionSettings />}
             {current === "export" && <ExportSettings />}
             {current === "about" && <AboutSettings />}
           </div>

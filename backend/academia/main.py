@@ -177,9 +177,9 @@ def create_app() -> FastAPI:
     )
     _register_errors(app)
 
-    from .api import admin, auth, files, models, nodes, notebooks, search
+    from .api import admin, auth, files, nodes, notebooks, search
 
-    for module in (auth, admin, nodes, notebooks, files, search, models):
+    for module in (auth, admin, nodes, notebooks, files, search):
         app.include_router(module.router, prefix="/api")
 
     @app.api_route("/api/health", methods=["GET", "HEAD"], tags=["meta"])

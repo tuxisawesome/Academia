@@ -252,13 +252,14 @@ class Pin(Base):
 
 
 class PageText(Base):
-    """Searchable text of one page of an uploaded PDF. Never shown to users.
+    """Text layer of one page of an uploaded PDF, extracted on the server for search.
+    Never shown to users.
 
-    ``embedded_text`` comes from the PDF's own text layer (extracted on the server);
-    ``ocr_text`` is recognised from the page image by a browser (handwriting). The
-    ``page_text_fts`` full-text index is kept in sync by triggers (see migration 0002).
-    A future migration that alters this table in Alembic batch mode recreates the table,
-    which drops those triggers: such a migration must create them again.
+    A row exists once the page has been processed (``body`` is empty if the page has no
+    text layer, e.g. scanned handwriting). The ``page_text_fts`` full-text index is kept in
+    sync by triggers (see migration 0002). A future migration that alters this table in
+    Alembic batch mode recreates the table, which drops those triggers: such a migration
+    must create them again.
     """
 
     __tablename__ = "page_texts"
@@ -267,16 +268,5 @@ class PageText(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_id: Mapped[str] = mapped_column(ForeignKey("sources.id", ondelete="CASCADE"))
     idx: Mapped[int] = mapped_column(Integer)
-    embedded_text: Mapped[str] = mapped_column(Text, default="")
-    embedded_done: Mapped[bool] = mapped_column(Boolean, default=False)
-    ocr_text: Mapped[str] = mapped_column(Text, default="")
-    # Engine that produced ocr_text, and its quality rank: a page is re-read only by a
-    # better-ranked engine, so a weaker device never overwrites a stronger result.
-    ocr_engine: Mapped[str | None] = mapped_column(String(64))
-    ocr_rank: Mapped[int | None] = mapped_column(Integer)
-    ocr_failed_rank: Mapped[int | None] = mapped_column(Integer)
-    ocr_attempts: Mapped[int] = mapped_column(Integer, default=0)
-    # A device that is currently reading this page.
-    lease_owner: Mapped[str | None] = mapped_column(String(64))
-    lease_until: Mapped[datetime | None]
+    body: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(default=utcnow)

@@ -35,9 +35,6 @@ export default defineConfig({
       "/api": { target: backend, changeOrigin: false },
     },
   },
-  worker: {
-    format: "es",
-  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

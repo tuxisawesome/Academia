@@ -4,7 +4,6 @@ import { createNotebook } from "../api/actions";
 import { invalidateLibrary, queryClient } from "../api/queries";
 import { baseName, isPdfFile, uploadPdf } from "../api/upload";
 import type { NotebookDetail } from "../api/types";
-import { pokeRecognition } from "../features/recognition";
 import { toast } from "./toasts";
 
 export interface UploadItem {
@@ -66,10 +65,7 @@ export async function uploadAsNotebooks(files: File[], folderId: string | null):
       }),
     ),
   );
-  if (pdfs.length) {
-    await invalidateLibrary();
-    pokeRecognition();
-  }
+  if (pdfs.length) await invalidateLibrary();
 }
 
 /** Appends each PDF (in order) to the end of an existing notebook. */
@@ -84,8 +80,5 @@ export async function appendToNotebook(files: File[], notebookId: string): Promi
       queryClient.setQueryData(["notebook", notebookId], detail);
     });
   }
-  if (pdfs.length) {
-    await invalidateLibrary();
-    pokeRecognition();
-  }
+  if (pdfs.length) await invalidateLibrary();
 }

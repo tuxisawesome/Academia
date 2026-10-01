@@ -1,10 +1,8 @@
 """Library search: item names ("Files") and page text ("Contents").
 
 The search is scoped to a folder and everything below it (or the whole library).
-Page text comes from PDFs' own text layers and from handwriting recognition, which is
-often imperfect, so words also match close misspellings found in the index's vocabulary
-(1 edit for 4–6 letter words, 2 for longer ones). Results report *which pages* match;
-the recognised text itself is never returned.
+Page text comes from the uploaded PDFs' own text layers. Results report *which pages*
+match; the text itself is never returned.
 """
 
 from __future__ import annotations
@@ -14,19 +12,15 @@ import unicodedata
 from collections import defaultdict
 from typing import Any
 
-from rapidfuzz import process
-from rapidfuzz.distance import Levenshtein
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from ..models import BOOKMARK, FOLDER, NOTEBOOK, Node, Page, SourcePage
 from .common import chunks, descendant_ids, owned_folder_or_root
 from .describe import bookmark_members, describe_nodes, page_json
-from .ocr import unread_pages_in
 
 MAX_RESULTS = 200
 MAX_PAGES_PER_RESULT = 60
-MAX_EXPANSIONS = 25
 
 _word_re = re.compile(r"\w+", re.UNICODE)
 _phrase_re = re.compile(r'"([^"]+)"')
@@ -46,7 +40,8 @@ def parse_query(query: str) -> tuple[list[str], list[list[str]]]:
     rest = _phrase_re.sub(" ", q)
     words = list(dict.fromkeys(_word_re.findall(rest)))
     if len(words) > 1:
-        words = [w for w in words if len(w) > 1] or words
+        # Stray single letters are dropped, but numbers ("lecture 7") narrow the search.
+        words = [w for w in words if len(w) > 1 or w.isdigit()] or words
     return words, phrases
 
 
@@ -54,25 +49,17 @@ def _quote(term: str) -> str:
     return '"' + term.replace('"', '""') + '"'
 
 
-def _word_clause(word: str, extra: list[str]) -> str:
-    options = [_quote(word) + ("*" if len(word) >= 3 else "")]
-    options += [_quote(t) for t in extra if t != word]
-    return options[0] if len(options) == 1 else "(" + " OR ".join(options) + ")"
+def _word_clause(word: str) -> str:
+    """A word matches itself or, from three letters on, any word it starts."""
+    return _quote(word) + ("*" if len(word) >= 3 else "")
 
 
-def _expansions(db: Session, word: str) -> list[str]:
-    if len(word) < 4 or word.isdigit():
-        return []
-    k = 1 if len(word) <= 6 else 2
-    terms = db.execute(
-        text("SELECT term FROM page_text_vocab WHERE length(term) BETWEEN :lo AND :hi"),
-        {"lo": len(word) - k, "hi": len(word) + k},
-    ).scalars()
-    found = process.extract(word, list(terms), scorer=Levenshtein.distance, score_cutoff=k, limit=MAX_EXPANSIONS)
-    return [term for term, _dist, _ in found if term != word]
-
-
-def _match_pages(db: Session, user_id: str, expr: str) -> set[tuple[str, int]]:
+def matching_pages(db: Session, user_id: str, query: str) -> set[tuple[str, int]]:
+    """(source_id, page index) of the user's pages whose text contains every word and phrase."""
+    words, phrases = parse_query(query)
+    if not words and not phrases:
+        return set()
+    expr = " AND ".join([_word_clause(w) for w in words] + [_quote(" ".join(p)) for p in phrases])
     rows = db.execute(
         text(
             """
@@ -86,23 +73,6 @@ def _match_pages(db: Session, user_id: str, expr: str) -> set[tuple[str, int]]:
         {"expr": expr, "uid": user_id},
     ).all()
     return {(r[0], r[1]) for r in rows}
-
-
-def matching_pages(db: Session, user_id: str, query: str) -> dict[tuple[str, int], bool]:
-    """Source pages whose text matches; the value is True for exact (not just fuzzy) matches."""
-    words, phrases = parse_query(query)
-    if not words and not phrases:
-        return {}
-    phrase_clauses = [_quote(" ".join(p)) for p in phrases]
-    exact_expr = " AND ".join([_word_clause(w, []) for w in words] + phrase_clauses)
-    exact = _match_pages(db, user_id, exact_expr)
-    result = dict.fromkeys(exact, True)
-    expansions = {w: _expansions(db, w) for w in words}
-    if any(expansions.values()):
-        fuzzy_expr = " AND ".join([_word_clause(w, expansions[w]) for w in words] + phrase_clauses)
-        for key in _match_pages(db, user_id, fuzzy_expr):
-            result.setdefault(key, False)
-    return result
 
 
 def _scope_nodes(db: Session, user_id: str, folder: Node | None) -> list[Node]:
@@ -142,7 +112,7 @@ def search(db: Session, user_id: str, query: str, folder_id: str | None = None) 
     q = " ".join((query or "").split())
     scope = {"id": folder.id, "name": folder.name} if folder else None
     if not q:
-        return {"query": q, "scope": scope, "files": [], "contents": [], "unread_pages": 0}
+        return {"query": q, "scope": scope, "files": [], "contents": []}
 
     nodes = _scope_nodes(db, user_id, folder)
     location = _locations(db, user_id)
@@ -173,45 +143,25 @@ def search(db: Session, user_id: str, query: str, folder_id: str | None = None) 
                 key = (page.source_id, page.source_index)
                 if page.notebook_id in nb_ids and key in matched:
                     number = (page.position or 0) + 1
-                    hits[page.notebook_id].append(
-                        {**page_json(page, sp), "number": number, "open_page": number, "exact": matched[key]}
-                    )
+                    hits[page.notebook_id].append({**page_json(page, sp), "number": number, "open_page": number})
         members = bookmark_members(db, [b.id for b in bookmarks])
         for bm in bookmarks:
             # open_page: the page's place within the bookmark (what the bookmark reader shows).
             for k, (page, sp) in enumerate(members.get(bm.id, []), start=1):
                 key = (page.source_id, page.source_index)
                 if key in matched:
-                    hits[bm.id].append(
-                        {
-                            **page_json(page, sp),
-                            "number": (page.position or 0) + 1,
-                            "open_page": k,
-                            "exact": matched[key],
-                        }
-                    )
+                    hits[bm.id].append({**page_json(page, sp), "number": (page.position or 0) + 1, "open_page": k})
 
     by_id = {n.id: n for n in nodes}
     ranked = sorted(
         hits,
-        key=lambda nid: (
-            -sum(1 for m in hits[nid] if m["exact"]),
-            -len(hits[nid]),
-            normalize(by_id[nid].name),
-        ),
+        key=lambda nid: (-len(hits[nid]), normalize(by_id[nid].name)),
     )[:MAX_RESULTS]
     contents = describe_nodes(db, [by_id[i] for i in ranked])
     for item in contents:
         pages = sorted(hits[item["id"]], key=lambda m: m["number"])
         item["location"] = location(item["parent_id"])
         item["match_count"] = len(pages)
-        item["exact_count"] = sum(1 for m in pages if m["exact"])
         item["matches"] = pages[:MAX_PAGES_PER_RESULT]
 
-    return {
-        "query": q,
-        "scope": scope,
-        "files": files,
-        "contents": contents,
-        "unread_pages": unread_pages_in(db, [n.id for n in notebooks]),
-    }
+    return {"query": q, "scope": scope, "files": files, "contents": contents}

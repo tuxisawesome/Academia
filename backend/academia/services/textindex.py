@@ -1,7 +1,8 @@
-"""Searchable page text: the PDF's own text layer, extracted on the server.
+"""Searchable page text: each uploaded PDF's own text layer, extracted on the server.
 
-Handwriting is recognised by browsers instead (see ``services/ocr.py``); both kinds of
-text land in ``page_texts`` and the ``page_text_fts`` index. Neither is ever shown to users.
+The text lands in ``page_texts`` and the ``page_text_fts`` index and is only used by search;
+it is never shown to users. Pages without a text layer (scans, handwriting) simply have no
+searchable text.
 """
 
 from __future__ import annotations
@@ -22,18 +23,6 @@ log = logging.getLogger(__name__)
 BATCH = 32
 
 
-def ensure_rows(db, source_id: str, page_count: int) -> None:  # noqa: ANN001
-    """Create the page_texts rows of a source that don't exist yet."""
-    have = set(db.scalars(select(PageText.idx).where(PageText.source_id == source_id)))
-    now = utcnow()
-    db.add_all(
-        PageText(source_id=source_id, idx=i, embedded_text="", ocr_text="", updated_at=now)
-        for i in range(page_count)
-        if i not in have
-    )
-    db.flush()
-
-
 def index_source(source_id: str) -> int:
     """Extract and store the text layer of every page of a source. Returns pages indexed."""
     with read_session() as db:
@@ -41,9 +30,7 @@ def index_source(source_id: str) -> int:
         if src is None:
             return 0
         page_count = src.page_count
-        done = set(
-            db.scalars(select(PageText.idx).where(PageText.source_id == source_id, PageText.embedded_done.is_(True)))
-        )
+        done = set(db.scalars(select(PageText.idx).where(PageText.source_id == source_id)))
     todo = [i for i in range(page_count) if i not in done]
     path = source_path(source_id)
     if not todo or not path.exists():
@@ -55,19 +42,13 @@ def index_source(source_id: str) -> int:
         with write_session() as db:
             if db.get(Source, source_id) is None:
                 return indexed
-            ensure_rows(db, source_id, page_count)
-            rows = {
-                r.idx: r
-                for r in db.scalars(select(PageText).where(PageText.source_id == source_id, PageText.idx.in_(chunk)))
-            }
+            have = set(db.scalars(select(PageText.idx).where(PageText.source_id == source_id, PageText.idx.in_(chunk))))
             now = utcnow()
-            for idx in chunk:
-                row = rows.get(idx)
-                if row is None:
-                    continue
-                row.embedded_text = texts.get(idx, "")
-                row.embedded_done = True
-                row.updated_at = now
+            db.add_all(
+                PageText(source_id=source_id, idx=idx, body=texts.get(idx, ""), updated_at=now)
+                for idx in chunk
+                if idx not in have
+            )
         indexed += len(chunk)
     return indexed
 
@@ -75,13 +56,7 @@ def index_source(source_id: str) -> int:
 def sources_needing_text() -> list[str]:
     """Sources with pages whose text layer hasn't been extracted yet (oldest first)."""
     with read_session() as db:
-        done = dict(
-            db.execute(
-                select(PageText.source_id, func.count())
-                .where(PageText.embedded_done.is_(True))
-                .group_by(PageText.source_id)
-            ).all()
-        )
+        done = dict(db.execute(select(PageText.source_id, func.count()).group_by(PageText.source_id)).all())
         rows = db.execute(
             select(Source.id, Source.page_count).where(Source.orphaned_at.is_(None)).order_by(Source.created_at)
         ).all()

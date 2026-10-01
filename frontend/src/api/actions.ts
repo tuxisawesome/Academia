@@ -244,8 +244,6 @@ export async function updatePrefs(patch: Partial<Prefs>) {
 }
 
 export async function logout() {
-  const { stopRecognition } = await import("../features/recognition");
-  stopRecognition();
   try {
     await api("/auth/logout", { method: "POST" });
   } finally {

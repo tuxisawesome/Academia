@@ -16,9 +16,8 @@ A self-hosted library for PDFs, with **Notebooks** and **Bookmarks** kept in fol
   - **Files**: folders, notebooks and bookmarks whose names match.
   - **Contents**: the pages whose text matches, shown as page thumbnails that open the reader on that page.
   - From the Library, search covers everything. Inside a folder, it covers that folder and all its subfolders.
-  - Typed PDFs are searchable right after upload.
-  - Handwriting is read by the browsers you use, on their own graphics card. Search tolerates the small misreads messy handwriting produces.
-  - The recognised text is used only for search: it is never shown and never added to downloaded PDFs.
+  - Contents search uses the PDFs' own text layer (text you could select in a PDF viewer), indexed right after upload. Scanned or handwritten pages have no text layer, so only their names are searchable.
+  - The indexed text is used only for search; it is never shown in the app.
 - **File browser** that works like Windows Explorer:
   - grid and list views
   - right-click menus, multi-select (Ctrl/Shift-click, rubber-band, Ctrl+A)
@@ -98,7 +97,7 @@ Running the installer again is safe. It repairs or updates the installation and 
 | `/opt/academia/releases/<commit>` | Built versions of the app; `/opt/academia/current` points at the active one |
 | `/opt/academia/src` | Git checkout used to fetch updates |
 | `/opt/academia/tools`, `/opt/academia/python` | Pinned uv, Python 3.13 and Node.js (Node only builds the web app) |
-| `/var/lib/academia` | **Your data**: database, uploaded PDFs, thumbnails, caches, backups, and the mirrored recognition model files (`models/`) |
+| `/var/lib/academia` | **Your data**: database, uploaded PDFs, thumbnails, caches and backups |
 | `/etc/academia/academia.env` | Settings (upload size limit, cache size, …) |
 | `/etc/caddy/sites/academia.caddy` | Web server configuration (Caddy: HTTPS, compression) |
 
@@ -106,26 +105,6 @@ Running the installer again is safe. It repairs or updates the installation and 
 - `academia.service`: the app. It runs as the unprivileged `academia` user, is sandboxed by systemd, and listens only on `127.0.0.1:8750`.
 - `academia-backup.timer`: nightly database backup; the last 14 are kept.
 - `academia-maint.timer`: nightly housekeeping. It empties the Trash after 30 days, removes deleted pages after 7 days, and trims caches.
-
-### Handwriting recognition (runs in your browser)
-
-The server only stores the text; your browsers do the actual reading. This keeps the server small and cheap.
-
-**How it works:**
-1. While Academia is open on a computer with a capable graphics card, that browser quietly reads unread pages in the background, newest uploads first.
-2. It renders each page itself and runs a vision-language model with WebGPU: Qwen3.5 2B, or 0.8B on smaller GPUs (Apache-2.0).
-3. It sends back only the text.
-
-**Model download:**
-- The first time, each browser downloads the model: about 2.1 GB, or 0.8 GB for the light model.
-- It's kept in the browser for next time.
-- The server fetches the model files from Hugging Face once, the first time a browser asks, and keeps them in `/var/lib/academia/models`. The server therefore needs outbound internet access, and about 3 GB of disk if both models are used.
-
-**Devices:**
-- Several open devices share the work.
-- A page read with the light model is read again later by a device using the standard model.
-- Settings → **Text recognition** shows progress. There you can turn reading on or off for the current device (it's on by default for computers and off for phones), choose the model, or have everything read again.
-- It needs a browser with WebGPU: current Chrome, Edge and Safari, and Firefox on Windows/macOS. On Linux, check `chrome://gpu`.
 
 ## Updating
 
@@ -253,14 +232,11 @@ cd frontend && npm run build && npm run e2e   # Playwright end-to-end tests (use
 - Uploaded PDFs are stored once and never modified.
 - A notebook is an ordered list of page references into them. A bookmark is a set of those page ids, which is why it follows its pages through moves, inserts and reordering.
 - Generated PDFs are cached under a hash of their contents.
-- Page text, both the PDFs' own text layers and handwriting recognised in browsers, is stored per page of each uploaded PDF in a SQLite FTS5 index.
-- Typo-tolerant search expands each word to close spellings found in the index's vocabulary, using rapidfuzz.
-- Browsers fetch pages to read and submit results through `/api/ocr/*`. Each claimed page is leased to one device so devices don't duplicate work. Each engine has a quality rank, so better models replace results from weaker ones.
+- Each uploaded PDF's text layer is extracted in the background and stored per page in a SQLite FTS5 index, which powers the Contents half of search.
 
 **Frontend** (`frontend/`):
 - React, TypeScript and Vite, with TanStack Query and Radix UI primitives.
 - **pdf.js** powers the reader.
-- Handwriting recognition runs in a Web Worker with **transformers.js** on WebGPU. Model files come from the server's `/api/models/` mirror, so the app's Content-Security-Policy can stay `connect-src 'self'`.
 - A hand-written service worker caches only the offline page.
 
 **Deployment** (`deploy/`):

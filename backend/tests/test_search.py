@@ -6,11 +6,8 @@ from sqlalchemy import func, select, text
 
 from academia.db import read_session
 from academia.models import PageText
-from academia.services.textindex import index_source
+from academia.services.textindex import index_source, sources_needing_text
 from conftest import make_pdf, make_text_pdf, new_notebook, upload
-
-DEVICE = "device-0001-abcdef"
-DEVICE2 = "device-0002-abcdef"
 
 
 def text_notebook(client, tmp_path: Path, name: str, texts: list[str], parent_id=None) -> dict:  # noqa: ANN001
@@ -27,18 +24,6 @@ def search(client, q: str, folder: str | None = None) -> dict:  # noqa: ANN001
     r = client.get("/api/search", params=params)
     assert r.status_code == 200, r.text
     return r.json()
-
-
-def claim(client, rank: int = 10, limit: int = 8, device: str = DEVICE, engine: str = "test-engine") -> list[dict]:  # noqa: ANN001
-    r = client.post("/api/ocr/claim", json={"device": device, "engine": engine, "rank": rank, "limit": limit})
-    assert r.status_code == 200, r.text
-    return r.json()["pages"]
-
-
-def submit(client, items: list[dict], rank: int = 10, device: str = DEVICE, engine: str = "test-engine") -> int:  # noqa: ANN001
-    r = client.post("/api/ocr/submit", json={"device": device, "engine": engine, "rank": rank, "items": items})
-    assert r.status_code == 200, r.text
-    return r.json()["stored"]
 
 
 # ---- pins ---------------------------------------------------------------------------------
@@ -75,7 +60,7 @@ def test_pins(client, other_client, tmp_path: Path):
 # ---- search: scope, files and contents ------------------------------------------------------
 
 
-def test_embedded_text_search_is_scoped_and_recursive(client, tmp_path: Path):
+def test_text_search_is_scoped_and_recursive(client, tmp_path: Path):
     chem = client.post("/api/folders", json={"name": "Chemistry"}).json()
     organic = client.post("/api/folders", json={"name": "Organic", "parent_id": chem["id"]}).json()
     physics = client.post("/api/folders", json={"name": "Physics"}).json()
@@ -92,7 +77,6 @@ def test_embedded_text_search_is_scoped_and_recursive(client, tmp_path: Path):
     assert sorted(c["name"] for c in in_chem["contents"]) == ["Alkenes", "Lecture 1"]
     lecture = next(c for c in in_chem["contents"] if c["name"] == "Lecture 1")
     assert [m["number"] for m in lecture["matches"]] == [2]
-    assert lecture["matches"][0]["exact"] is True
     assert lecture["location"] == "Chemistry"
 
     assert [c["name"] for c in search(client, "entropy", organic["id"])["contents"]] == ["Alkenes"]
@@ -102,6 +86,14 @@ def test_embedded_text_search_is_scoped_and_recursive(client, tmp_path: Path):
     # Prefix while typing, accent-insensitive, multiple words.
     assert [c["name"] for c in search(client, "kinet", chem["id"])["contents"]] == ["Lecture 1"]
     assert [c["name"] for c in search(client, "ENTROPY enthalpy")["contents"]] == ["Lecture 1"]
+
+
+def test_numbers_narrow_the_search(client, tmp_path: Path):
+    text_notebook(client, tmp_path, "Lectures", [f"Lecture {n}" for n in range(1, 13)])
+    assert len(search(client, "lecture")["contents"][0]["matches"]) == 12
+    assert [m["number"] for m in search(client, "lecture 7")["contents"][0]["matches"]] == [7]
+    # Single letters are ignored rather than required.
+    assert len(search(client, "lecture x")["contents"][0]["matches"]) == 12
 
 
 def test_bookmarks_in_contents(client, tmp_path: Path):
@@ -117,76 +109,25 @@ def test_bookmarks_in_contents(client, tmp_path: Path):
     ]
 
 
-# ---- handwriting recognition queue ----------------------------------------------------------
-
-
-def test_recognition_queue_and_fuzzy_search(client, tmp_path: Path):
-    nb = new_notebook(client, tmp_path, pages=3, name="Handwritten")
-    pages = claim(client)
-    assert {(p["source_id"], p["index"]) for p in pages} == {(nb["pages"][0]["source_id"], i) for i in range(3)}
-    assert claim(client, device=DEVICE2) == []  # leased to the first device
-    src = pages[0]["source_id"]
-    stored = submit(
-        client,
-        [
-            {"source_id": src, "index": 0, "text": "Thermodynamcis — second law, entropy"},
-            {"source_id": src, "index": 1, "text": "Carnot cycle"},
-            {"source_id": src, "index": 2, "error": "model crashed"},
-        ],
-    )
-    assert stored == 2
-    assert client.get("/api/ocr/status", params={"rank": 10}).json() == {"total": 3, "read": 2, "remaining": 1}
-
-    # The misspelled word is still found, as a non-exact match.
-    result = search(client, "thermodynamics")
-    assert [c["name"] for c in result["contents"]] == ["Handwritten"]
-    match = result["contents"][0]["matches"][0]
-    assert match["number"] == 1 and match["exact"] is False
-    assert search(client, "carnot")["contents"][0]["matches"][0]["exact"] is True
-    # The recognised text is never sent back.
-    assert "Thermodynamcis" not in client.get("/api/search", params={"q": "thermodynamics"}).text
+def test_contents_are_private_and_never_returned(client, other_client, tmp_path: Path):
+    nb = text_notebook(client, tmp_path, "Thermo", ["Carnot cycle", "Second law"])
+    assert [c["name"] for c in search(client, "carnot")["contents"]] == ["Thermo"]
+    # Only *which* pages match is reported; the page text itself never leaves the server.
+    assert "Carnot" not in client.get("/api/search", params={"q": "carnot"}).text
     assert "Carnot" not in client.get(f"/api/notebooks/{nb['id']}").text
-
-    # Failed pages are retried until they've failed three times.
-    for _ in range(2):
-        retry = claim(client)
-        assert [(p["index"]) for p in retry] == [2]
-        submit(client, [{"source_id": src, "index": 2, "error": "again"}])
-    assert claim(client) == []
-    # A better engine re-reads everything (including the failed page)...
-    assert len(claim(client, rank=20, engine="better")) == 3
-    # ...but a weaker one never overwrites a better result.
-    submit(client, [{"source_id": src, "index": 1, "text": "Carnot heat engine"}], rank=20, engine="better")
-    submit(client, [{"source_id": src, "index": 1, "text": "garbage"}], rank=5, engine="weak")
-    assert search(client, "garbage")["contents"] == []
-    assert search(client, "engine")["contents"][0]["name"] == "Handwritten"
+    assert search(other_client, "carnot")["contents"] == []
 
 
-def test_unread_pages_reported_and_other_users_isolated(client, other_client, tmp_path: Path):
-    folder = client.post("/api/folders", json={"name": "F"}).json()
-    nb = new_notebook(client, tmp_path, pages=2, parent_id=folder["id"])
-    assert search(client, "anything", folder["id"])["unread_pages"] == 2
-    src = nb["pages"][0]["source_id"]
-    assert other_client.post(
-        "/api/ocr/submit",
-        json={"device": DEVICE2, "engine": "x", "rank": 50, "items": [{"source_id": src, "index": 0, "text": "hack"}]},
-    ).json() == {"stored": 0}
-    assert claim(other_client, device=DEVICE2) == []
-    assert search(other_client, "p1")["contents"] == []
-    assert other_client.get(f"/api/sources/{src}/file").status_code == 404
+def test_phrases_and_pages_without_text(client, tmp_path: Path):
+    text_notebook(client, tmp_path, "Laws", ["second law of thermodynamics", "the law, second edition"])
+    assert [m["number"] for m in search(client, "second law")["contents"][0]["matches"]] == [1, 2]
+    assert [m["number"] for m in search(client, '"second law"')["contents"][0]["matches"]] == [1]
 
-
-def test_rotation_hint_and_source_file(client, tmp_path: Path):
-    nb = new_notebook(client, tmp_path, pages=2)
-    first = nb["pages"][0]
-    client.post(
-        f"/api/notebooks/{nb['id']}/pages/rotate", json={"base_rev": nb["rev"], "page_ids": [first["id"]], "delta": 90}
-    )
-    pages = {p["index"]: p for p in claim(client)}
-    assert pages[0]["rotation"] == 90 and pages[1]["rotation"] == 0
-    r = client.get(f"/api/sources/{first['source_id']}/file", headers={"Range": "bytes=0-7"})
-    assert r.status_code == 206 and r.content.startswith(b"%PDF")
-    assert "immutable" in r.headers["cache-control"]
+    # Pages without a text layer (scans, handwriting) are recorded as empty and not re-read.
+    src = upload(client, make_text_pdf(tmp_path / "scan.pdf", ["", ""]))
+    assert index_source(src["id"]) == 2
+    assert src["id"] not in sources_needing_text()
+    assert index_source(src["id"]) == 0
 
 
 def test_text_removed_with_source(client, tmp_path: Path):
@@ -211,13 +152,3 @@ def test_text_removed_with_source(client, tmp_path: Path):
     with read_session() as db:
         assert db.scalar(select(func.count()).select_from(PageText)) == 0
         assert db.execute(text("select count(*) from page_text_fts")).scalar() == 0
-
-
-def test_reset_requeues_but_keeps_text(client, tmp_path: Path):
-    new_notebook(client, tmp_path, pages=1, name="Again")
-    page = claim(client)[0]
-    submit(client, [{"source_id": page["source_id"], "index": 0, "text": "photosynthesis"}])
-    assert claim(client) == []
-    assert client.post("/api/ocr/reset").json() == {"queued": 1}
-    assert len(claim(client)) == 1
-    assert search(client, "photosynthesis")["contents"][0]["name"] == "Again"

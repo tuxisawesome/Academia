@@ -15,7 +15,6 @@ dependencies = [
     "pypdfium2>=5",
     "pillow>=11.3",
     "typer>=0.16",
-    "rapidfuzz>=3.13",
 ]
 
 [project.scripts]

@@ -12,7 +12,9 @@ export function startNodeDrag(
   label: string,
 ): void {
   dragging = { ids, folderIds: new Set(folderIds), fromFolder };
-  e.dataTransfer.effectAllowed = "copyMove";
+  // Folders move/copy items ("move"/"copy"); the sidebar's Pinned section links them ("link").
+  // A drop whose effect isn't allowed here is silently cancelled by the browser.
+  e.dataTransfer.effectAllowed = "all";
   e.dataTransfer.setData(NODE_MIME, JSON.stringify(ids));
   e.dataTransfer.setData("text/plain", label);
   const ghost = document.createElement("div");

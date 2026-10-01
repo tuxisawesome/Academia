@@ -35,9 +35,6 @@ class Settings(BaseSettings):
     orphan_source_grace_days: int = 21
     export_ttl_hours: int = 24
 
-    # Where browsers' handwriting-recognition model files are fetched from (then mirrored).
-    hf_endpoint: str = "https://huggingface.co"
-
     # Extra origins allowed to make state-changing requests (besides same-host).
     extra_origins: list[str] = Field(default_factory=list)
 

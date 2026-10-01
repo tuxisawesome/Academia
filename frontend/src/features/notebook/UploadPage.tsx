@@ -12,7 +12,6 @@ import { formatBytes, plural } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
 import { toast } from "../../state/toasts";
 import { Breadcrumbs } from "../explorer/ExplorerPage";
-import { pokeRecognition } from "../recognition";
 
 interface QueuedFile {
   key: number;
@@ -115,7 +114,6 @@ export function UploadPage() {
         const inserted = detail.inserted_page_ids ?? [];
         if (inserted.length) pos = { at: "after", afterPageId: inserted[inserted.length - 1] };
       }
-      pokeRecognition();
       toast(`Added ${plural(newPages, "page")} to “${nb.name}”.`);
       navigate(`/n/${nb.id}`);
     } catch (err) {

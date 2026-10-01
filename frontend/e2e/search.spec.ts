@@ -40,7 +40,7 @@ test.describe.serial("Pinned folders and search", () => {
     await expect(pinned.locator(".pin-item")).toHaveText(["Biology", "Chemistry"]);
     await pinned.getByRole("link", { name: "Chemistry" }).click();
     await expect(page).toHaveURL(/\/f\//);
-    await expect(page.locator(".breadcrumbs")).toContainText("Chemistry");
+    await expect(page.getByRole("navigation", { name: "Breadcrumb" })).toContainText("Chemistry");
 
     // Pins survive a reload (stored on the server).
     await page.reload();
@@ -61,8 +61,8 @@ test.describe.serial("Pinned folders and search", () => {
 
     const box = page.getByRole("searchbox");
     await expect(box).toHaveAttribute("placeholder", "Search “Chemistry”");
-    await box.fill("lecture 7");
-    await expect(page).toHaveURL(/\/search\?q=lecture\+7&in=/);
+    await box.fill("lecture");
+    await expect(page).toHaveURL(/\/search\?q=lecture&in=/);
     await expect(page.locator(".scope-chip")).toContainText("in Chemistry and its subfolders");
 
     const files = page.locator(".search-section", { hasText: "Files" });
@@ -75,7 +75,13 @@ test.describe.serial("Pinned folders and search", () => {
         return contents.locator(".content-hit").count();
       }, { timeout: 30_000 })
       .toBe(1);
+    await expect(contents.locator(".hit-page")).toHaveCount(12);
+
+    // A number narrows the pages; names must contain every word, so Files is now empty.
+    await box.fill("lecture 7");
+    await expect(page).toHaveURL(/\/search\?q=lecture\+7&in=/);
     await expect(contents.locator(".hit-page")).toHaveText([/p\. 7/]);
+    await expect(files.locator(".list-view .row:not(.head)")).toHaveCount(0);
 
     // Sections collapse.
     await files.locator(".section-toggle").click();
@@ -90,10 +96,13 @@ test.describe.serial("Pinned folders and search", () => {
     await expect(page.locator(".search-section", { hasText: "Contents" })).toContainText("No pages mention");
     await page.locator(".scope-chip").getByTitle("Search everywhere").click();
     await expect(page.locator(".scope-chip")).toContainText("in your whole library");
-    await expect(page.locator(".content-hit")).toHaveCount(1);
+    // Earlier specs' copies of the same PDF (in Physics) match too; ours is the one in Chemistry.
+    const ours = page.locator(".content-hit", { has: page.locator(".hit-location", { hasText: /^Chemistry$/ }) });
+    await expect(ours).toHaveCount(1);
+    await expect(page.locator(".content-hit", { hasText: "Physics" }).first()).toBeVisible();
 
     // Clicking a page opens the reader there.
-    await page.locator(".hit-page").first().click();
+    await ours.locator(".hit-page").click();
     await expect(page).toHaveURL(/\/read\/n\/.+\?page=7/);
     await expect(page.locator(".page-indicator")).toContainText("7");
   });

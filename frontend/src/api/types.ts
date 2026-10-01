@@ -176,14 +176,11 @@ export interface ContentMatch extends PageRef {
   number: number;
   /** Page to open in the reader (for bookmarks: its place within the bookmark). */
   open_page: number;
-  /** False when only a close spelling matched (likely a handwriting misread). */
-  exact: boolean;
 }
 
 export interface ContentResult extends LibraryNode {
   location: string;
   match_count: number;
-  exact_count: number;
   matches: ContentMatch[];
 }
 
@@ -192,11 +189,4 @@ export interface SearchResults {
   scope: { id: string; name: string } | null;
   files: LibraryNode[];
   contents: ContentResult[];
-  unread_pages: number;
-}
-
-export interface ReadingStatus {
-  total: number;
-  read: number;
-  remaining: number;
 }

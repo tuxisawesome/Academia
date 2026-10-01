@@ -69,7 +69,6 @@ function ContentHit({ item, onMenu }: { item: ContentResult; onMenu: (node: Libr
   const kind = item.kind === "bookmark" ? "b" : "n";
   const openItem = () => navigate(item.kind === "bookmark" ? `/read/b/${item.id}` : `/n/${item.id}`);
   const more = item.match_count - item.matches.length;
-  const approx = item.match_count - item.exact_count;
   return (
     <article className="content-hit" data-node-id={item.id} onContextMenu={() => onMenu(item)}>
       <header>
@@ -78,29 +77,19 @@ function ContentHit({ item, onMenu }: { item: ContentResult; onMenu: (node: Libr
           {item.name}
         </button>
         <span className="hit-location truncate">{item.location || "Library"}</span>
-        <span className="hit-count tabular">
-          {plural(item.match_count, "page")}
-          {approx > 0 && <span className="faint"> · {approx} approximate</span>}
-        </span>
+        <span className="hit-count tabular">{plural(item.match_count, "page")}</span>
       </header>
       <div className="hit-pages" role="list">
         {item.matches.map((m) => (
           <button
             key={m.id}
             role="listitem"
-            className={`hit-page ${m.exact ? "" : "approx"}`}
-            title={
-              m.exact
-                ? `Open page ${m.number}`
-                : `Open page ${m.number} — a close match; the handwriting may have been read slightly differently`
-            }
+            className="hit-page"
+            title={`Open page ${m.number}`}
             onClick={() => navigate(`/read/${kind}/${item.id}?page=${m.open_page}`)}
           >
             <PageThumb page={m} boxWidth={78} boxHeight={100} />
-            <span className="tabular">
-              p. {m.number}
-              {!m.exact && <span aria-label="approximate match"> ≈</span>}
-            </span>
+            <span className="tabular">p. {m.number}</span>
           </button>
         ))}
         {more > 0 && <span className="hit-more tabular">+{more} more</span>}
@@ -235,20 +224,16 @@ export function SearchPage() {
                   onToggle={() => toggle("contents")}
                 >
                   {contents.length === 0 ? (
-                    <p className="muted section-empty">No pages mention “{q}”.</p>
+                    <p className="muted section-empty">
+                      No pages mention “{q}”. Only text that can be selected in a PDF is searched; scanned or handwritten
+                      pages aren’t.
+                    </p>
                   ) : (
                     <div className="content-hits">
                       {contents.map((item) => (
                         <ContentHit key={item.id} item={item} onMenu={setMenuNode} />
                       ))}
                     </div>
-                  )}
-                  {data && data.unread_pages > 0 && (
-                    <p className="reading-note">
-                      {plural(data.unread_pages, "page")} {data.unread_pages === 1 ? "hasn't" : "haven't"} been read for
-                      handwriting yet, so {data.unread_pages === 1 ? "it isn't" : "they aren't"} fully searchable.{" "}
-                      <Link to="/settings/recognition">Text recognition</Link>
-                    </p>
                   )}
                 </Section>
               </>
