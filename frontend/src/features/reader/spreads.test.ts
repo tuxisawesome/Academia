@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { Spread, spreadModeFor, spreadPages } from "./spreads";
+import { pageAfterLayoutChange, Spread, spreadLabel, spreadModeFor, spreadPages } from "./spreads";
 
 describe("spreadModeFor", () => {
   it("uses two pages only on wide screens in automatic mode", () => {
@@ -28,5 +28,32 @@ describe("spreadPages", () => {
   });
   it("shows single pages without spreads", () => {
     expect(spreadPages(5, 10, Spread.NONE)).toEqual([5]);
+  });
+});
+
+describe("spreadLabel", () => {
+  it("joins neighbouring pages with a dash", () => {
+    expect(spreadLabel([3, 4])).toBe("3–4");
+    expect(spreadLabel([5])).toBe("5");
+  });
+
+  it("lists a bookmark's pages that are not neighbours in the notebook", () => {
+    // A bookmark of notebook pages 3, 7 and 10 shows 3 and 7 side by side.
+    expect(spreadLabel([3, 7])).toBe("3, 7");
+    expect(spreadLabel([7, 10])).toBe("7, 10");
+  });
+});
+
+describe("pageAfterLayoutChange", () => {
+  it("returns to the right-hand page the reader was on before the spread", () => {
+    // p. 4 in one-page mode; the spread 3–4 makes p. 3 current.
+    expect(pageAfterLayoutChange(3, 10, Spread.ODD, 4)).toBe(4);
+    expect(pageAfterLayoutChange(2, 10, Spread.EVEN, 3)).toBe(3);
+  });
+
+  it("follows pages turned since", () => {
+    expect(pageAfterLayoutChange(5, 10, Spread.ODD, 4)).toBe(5);
+    expect(pageAfterLayoutChange(7, 10, Spread.NONE, 4)).toBe(7);
+    expect(pageAfterLayoutChange(3, 10, Spread.ODD, null)).toBe(3);
   });
 });

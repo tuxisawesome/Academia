@@ -15,6 +15,7 @@ from academia.db import read_session, write_session
 from academia.models import Page, Source, utcnow
 from academia.services.export import safe_filename
 from academia.services.maintenance import run_maintenance, trim_pdf_cache
+from academia.services.thumbs import prewarmer
 from conftest import new_notebook, page_texts
 
 
@@ -101,6 +102,7 @@ def test_export_isolated(client, other_client, tmp_path: Path):
 
 def test_maintenance_deferred_source_deletion(client, tmp_path: Path, data_dir: Path):
     nb = new_notebook(client, tmp_path, pages=2)
+    prewarmer.stop()  # lets it finish, so it cannot add thumbnails after the source is deleted
     client.post(f"/api/notebooks/{nb['id']}/pages/delete", json={"page_ids": [p["id"] for p in nb["pages"]]})
     run_maintenance()
     assert len(list((data_dir / "sources").rglob("*.pdf"))) == 1  # soft-deleted pages still reference it

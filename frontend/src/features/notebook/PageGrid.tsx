@@ -37,6 +37,9 @@ interface DragState {
   kind: "reorder" | "paint" | "marquee";
   startX: number;
   startY: number;
+  /** Start point in content coordinates, so it stays put while the grid scrolls. */
+  originX: number;
+  originY: number;
   startIndex: number;
   pageId: string | null;
   moved: boolean;
@@ -88,7 +91,8 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     scrollToIndex: (index: number) => virtualizer.scrollToIndex(Math.floor(index / cols), { align: "center" }),
   }));
 
-  const anchor = useRef<number | null>(null);
+  // Id of the page Shift-click ranges start from (an index would go stale when pages change).
+  const anchor = useRef<string | null>(null);
   const drag = useRef<DragState | null>(null);
   // Time of the last drag/paint gesture; the click that follows it is ignored.
   const gestureEnd = useRef(0);
@@ -128,6 +132,11 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     [toContent, rows, rowH, cols, colW, pages.length],
   );
 
+  function anchorIndex(): number | null {
+    const i = anchor.current === null ? -1 : pages.findIndex((p) => p.id === anchor.current);
+    return i < 0 ? null : i;
+  }
+
   function stopAutoScroll() {
     if (autoScroll.current !== null) cancelAnimationFrame(autoScroll.current);
     autoScroll.current = null;
@@ -165,7 +174,7 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
       }
       onSelectedChange(next);
     } else {
-      const a = toContent(d.startX, d.startY);
+      const a = { x: d.originX, y: d.originY };
       const b = toContent(clientX, clientY);
       const r = { x: Math.min(a.x, b.x), y: Math.min(a.y, b.y), w: Math.abs(a.x - b.x), h: Math.abs(a.y - b.y) };
       setMarquee(r);
@@ -192,14 +201,16 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     const tile = (e.target as HTMLElement).closest<HTMLElement>("[data-page-index]");
     if ((e.target as HTMLElement).closest("button, input")) return;
     const touch = e.pointerType === "touch";
+    const origin = toContent(e.clientX, e.clientY);
     if (tile) {
       const index = Number(tile.dataset.pageIndex);
       const page = pages[index];
       if (mode === "pick") {
         if (touch) return; // taps toggle via click; dragging scrolls
-        if (e.shiftKey && anchor.current !== null) {
-          const lo = Math.min(anchor.current, index);
-          const hi = Math.max(anchor.current, index);
+        const a = anchorIndex();
+        if (e.shiftKey && a !== null) {
+          const lo = Math.min(a, index);
+          const hi = Math.max(a, index);
           const next = new Set(selected);
           for (let i = lo; i <= hi; i++) next.add(pages[i].id);
           onSelectedChange(next);
@@ -210,11 +221,13 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
         if (add) next.add(page.id);
         else next.delete(page.id);
         onSelectedChange(next);
-        anchor.current = index;
+        anchor.current = page.id;
         drag.current = {
           kind: "paint",
           startX: e.clientX,
           startY: e.clientY,
+          originX: origin.x,
+          originY: origin.y,
           startIndex: index,
           pageId: page.id,
           moved: false,
@@ -228,6 +241,8 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
           kind: "reorder",
           startX: e.clientX,
           startY: e.clientY,
+          originX: origin.x,
+          originY: origin.y,
           startIndex: index,
           pageId: page.id,
           moved: false,
@@ -237,10 +252,16 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
         };
       }
     } else if (mode === "edit" && !touch) {
+      // Ignore presses on the grid's scrollbar.
+      const el = scrollRef.current!;
+      const box = el.getBoundingClientRect();
+      if (e.clientX > box.left + el.clientWidth || e.clientY > box.top + el.clientHeight) return;
       drag.current = {
         kind: "marquee",
         startX: e.clientX,
         startY: e.clientY,
+        originX: origin.x,
+        originY: origin.y,
         startIndex: -1,
         pageId: null,
         moved: false,
@@ -271,12 +292,20 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     updateDrag(e.clientX, e.clientY);
   }
 
-  function onPointerUp(e: React.PointerEvent) {
+  /** Ends the current gesture without applying it and returns its state. */
+  function endDrag(e: React.PointerEvent): DragState | null {
     const d = drag.current;
     drag.current = null;
     stopAutoScroll();
     const el = scrollRef.current;
     if (el?.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
+    setDropIndex(null);
+    setMarquee(null);
+    return d;
+  }
+
+  function onPointerUp(e: React.PointerEvent) {
+    const d = endDrag(e);
     if (!d) return;
     if (d.kind === "reorder" && d.moved && onReorder) {
       const target = gapAt(e.clientX, e.clientY);
@@ -289,8 +318,11 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     }
     if (d.kind === "marquee" && !d.moved && !d.additive) onSelectedChange(new Set());
     if (d.moved || d.kind === "paint") gestureEnd.current = Date.now();
-    setDropIndex(null);
-    setMarquee(null);
+  }
+
+  // A cancelled gesture (e.g. the browser took a pen drag over for panning) is never applied.
+  function onPointerCancel(e: React.PointerEvent) {
+    endDrag(e);
   }
 
   function onTileClick(e: React.MouseEvent, index: number) {
@@ -304,14 +336,15 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     if (mode === "pick") {
       if (next.has(page.id)) next.delete(page.id);
       else next.add(page.id);
-      anchor.current = index;
+      anchor.current = page.id;
       onSelectedChange(next);
       return;
     }
     const additive = e.ctrlKey || e.metaKey || ((e.nativeEvent as PointerEvent).pointerType === "touch" && selected.size > 0);
-    if (e.shiftKey && anchor.current !== null) {
-      const lo = Math.min(anchor.current, index);
-      const hi = Math.max(anchor.current, index);
+    const a = anchorIndex();
+    if (e.shiftKey && a !== null) {
+      const lo = Math.min(a, index);
+      const hi = Math.max(a, index);
       const range = new Set(additive ? selected : []);
       for (let i = lo; i <= hi; i++) range.add(pages[i].id);
       onSelectedChange(range);
@@ -324,7 +357,7 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
     } else {
       onSelectedChange(new Set([page.id]));
     }
-    anchor.current = index;
+    anchor.current = page.id;
   }
 
   const items = virtualizer.getVirtualItems();
@@ -348,7 +381,7 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
-      onPointerCancel={onPointerUp}
+      onPointerCancel={onPointerCancel}
       onContextMenu={(e) => {
         const tile = (e.target as HTMLElement).closest<HTMLElement>("[data-page-index]");
         onPageContextMenu?.(tile ? pages[Number(tile.dataset.pageIndex)].id : null);
@@ -432,11 +465,21 @@ export const PageGrid = forwardRef<PageGridHandle, PageGridProps>(function PageG
 
 export const ZOOM_STEPS = [96, 128, 168, 220] as const;
 
+/** Zoom level from its stored value; `fallback` when nothing valid is stored. */
+export function parseZoomLevel(raw: string | null, fallback: number): number {
+  // Number(null) and Number("") are 0, so a missing value must be caught first.
+  const saved = raw === null || raw.trim() === "" ? NaN : Number(raw);
+  return Number.isInteger(saved) && saved >= 0 && saved < ZOOM_STEPS.length ? saved : fallback;
+}
+
 export function useGridZoom(key: string, fallback = 1): [number, (level: number) => void] {
   const storageKey = `academia-zoom-${key}`;
   const [level, setLevel] = useState(() => {
-    const saved = Number(localStorage.getItem(storageKey));
-    return Number.isInteger(saved) && saved >= 0 && saved < ZOOM_STEPS.length ? saved : fallback;
+    try {
+      return parseZoomLevel(localStorage.getItem(storageKey), fallback);
+    } catch {
+      return fallback;
+    }
   });
   const update = (l: number) => {
     const next = Math.max(0, Math.min(ZOOM_STEPS.length - 1, l));

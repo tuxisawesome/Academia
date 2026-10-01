@@ -25,18 +25,26 @@ def snap_width(width: int) -> int:
     return THUMB_WIDTHS[-1]
 
 
+def _rendered(path: Path) -> bool:
+    # An empty file is what a crash right after rendering can leave behind.
+    try:
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def ensure_thumb(source_id: str, idx: int, width: int) -> Path:
     width = snap_width(width)
     path = thumb_path(source_id, idx, width)
-    if path.exists():
+    if _rendered(path):
         return path
     with _locks.get(f"{source_id}:{idx}:{width}"):
-        if not path.exists():
+        if not _rendered(path):
             src = source_path(source_id)
             if not src.exists():
                 raise NotFound()
             pool.run(pdfops.render_thumbnails, str(src), [(idx, width, str(path))], timeout=120)
-    if not path.exists():
+    if not _rendered(path):
         raise NotFound()
     return path
 

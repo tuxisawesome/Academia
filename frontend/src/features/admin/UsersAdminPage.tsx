@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Navigate } from "react-router";
+import { useRef, useState } from "react";
+import { Navigate, useNavigate } from "react-router";
 import { Copy, KeyRound, MoreHorizontal, ShieldCheck, ShieldOff, Trash2, UserPlus, UserRoundCheck, UserRoundX } from "lucide-react";
 import { api, errorMessage } from "../../api/client";
 import { queryClient, useAdminUsers, useMe } from "../../api/queries";
@@ -15,12 +15,38 @@ function refresh() {
   return queryClient.invalidateQueries({ queryKey: ["admin", "users"] });
 }
 
+/** Copies `text`, falling back to selecting `el` where the Clipboard API is missing (plain-HTTP installs). */
+async function copyText(text: string, el: HTMLElement | null): Promise<boolean> {
+  if (navigator.clipboard) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      /* fall back to the selection below */
+    }
+  }
+  if (!el) return false;
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  const selection = window.getSelection();
+  selection?.removeAllRanges();
+  selection?.addRange(range);
+  try {
+    return document.execCommand("copy");
+  } catch {
+    return false;
+  }
+}
+
 function TempPasswordDialog({ info, onClose }: { info: { username: string; password: string } | null; onClose: () => void }) {
+  const codeRef = useRef<HTMLElement>(null);
   if (!info) return null;
+  // Locked: the password is shown only once, so a stray click outside or Escape mustn't lose it.
   return (
     <Modal
       open
       onOpenChange={(o) => !o && onClose()}
+      modalLock
       title="Temporary password"
       description={`Give this password to ${info.username}. They'll be asked to choose their own when they sign in.`}
       footer={
@@ -30,13 +56,14 @@ function TempPasswordDialog({ info, onClose }: { info: { username: string; passw
       }
     >
       <div className="temp-password">
-        <code className="tabular">{info.password}</code>
+        <code className="tabular" ref={codeRef}>
+          {info.password}
+        </code>
         <button
           className="btn btn-sm"
           onClick={() => {
-            navigator.clipboard?.writeText(info.password).then(
-              () => toast("Copied to clipboard."),
-              () => toast("Couldn't copy — please select and copy the password manually."),
+            void copyText(info.password, codeRef.current).then((ok) =>
+              toast(ok ? "Copied to clipboard." : "Couldn't copy — please select and copy the password manually."),
             );
           }}
         >
@@ -48,14 +75,14 @@ function TempPasswordDialog({ info, onClose }: { info: { username: string; passw
   );
 }
 
-function CreateUserDialog({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (u: string, p: string | null) => void }) {
+/** Mounted only while open, so every "Add user" starts from an empty form. */
+function CreateUserDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (u: string, p: string | null) => void }) {
   const [username, setUsername] = useState("");
   const [displayName, setDisplayName] = useState("");
   const [password, setPassword] = useState("");
   const [isAdmin, setIsAdmin] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  if (!open) return null;
   return (
     <Modal
       open
@@ -146,6 +173,7 @@ export function UsersAdminPage() {
   const { data: users, isLoading } = useAdminUsers();
   const [creating, setCreating] = useState(false);
   const [temp, setTemp] = useState<{ username: string; password: string } | null>(null);
+  const navigate = useNavigate();
 
   if (me && !me.is_admin) return <Navigate to="/" replace />;
 
@@ -155,9 +183,10 @@ export function UsersAdminPage() {
         method: "PATCH",
         json: body,
       });
-      await refresh();
+      // Show a one-time password before refetching, so a failing refetch can't hide it.
       if (res.temporary_password) setTemp({ username: user.username, password: res.temporary_password });
       else if (done) toast(done);
+      await refresh();
     } catch (err) {
       toastError(err);
     }
@@ -166,18 +195,21 @@ export function UsersAdminPage() {
   const entries = (user: AdminUser): MenuEntry[] => {
     const self = user.id === me?.id;
     return [
-      {
-        label: "Reset password",
-        icon: <KeyRound />,
-        onSelect: async () => {
-          const ok = await confirmDialog({
-            title: `Reset ${user.username}'s password?`,
-            message: "They'll be signed out everywhere and get a temporary password.",
-            confirmLabel: "Reset password",
-          });
-          if (ok) await patch(user, { reset_password: true });
-        },
-      },
+      self
+        ? // A reset would sign you out before its temporary password could be shown.
+          { label: "Change password…", icon: <KeyRound />, onSelect: () => void navigate("/settings/account") }
+        : {
+            label: "Reset password",
+            icon: <KeyRound />,
+            onSelect: async () => {
+              const ok = await confirmDialog({
+                title: `Reset ${user.username}'s password?`,
+                message: "They'll be signed out everywhere and get a temporary password.",
+                confirmLabel: "Reset password",
+              });
+              if (ok) await patch(user, { reset_password: true });
+            },
+          },
       user.is_admin
         ? {
             label: "Remove administrator",
@@ -293,14 +325,15 @@ export function UsersAdminPage() {
           </div>
         )}
       </div>
-      <CreateUserDialog
-        open={creating}
-        onClose={() => setCreating(false)}
-        onCreated={(username, password) => {
-          if (password) setTemp({ username, password });
-          else toast(`${username} was added.`);
-        }}
-      />
+      {creating && (
+        <CreateUserDialog
+          onClose={() => setCreating(false)}
+          onCreated={(username, password) => {
+            if (password) setTemp({ username, password });
+            else toast(`${username} was added.`);
+          }}
+        />
+      )}
       <TempPasswordDialog info={temp} onClose={() => setTemp(null)} />
     </div>
   );

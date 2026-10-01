@@ -6,6 +6,7 @@ import { BookmarkGlyph, FolderGlyph, NodeGlyph, NotebookGlyph } from "../../comp
 import { DropdownMenuContent } from "../../components/Menu";
 import { PageThumb } from "../../components/PageThumb";
 import { formatDate, plural } from "../../lib/format";
+import { isImeKey } from "../../lib/keys";
 import { useFolderDrop } from "../../layout/FolderTree";
 import { endNodeDrag, isFileDrag, startNodeDrag } from "../../state/drag";
 import { appendToNotebook } from "../../state/uploads";
@@ -28,7 +29,8 @@ export interface ItemViewProps {
   actions: NodeActions;
   folderId: string | null;
   renamingId: string | null;
-  onRenameDone: (id: string, name: string | null) => void;
+  /** `refocus`: give focus back to the list (the rename ended by keyboard or focus went nowhere). */
+  onRenameDone: (id: string, name: string | null, refocus: boolean) => void;
   cutIds: Set<string>;
   touch: boolean;
   /** Extra columns for special listings. */
@@ -40,7 +42,25 @@ export interface ItemViewProps {
   entriesFor?: (targets: LibraryNode[]) => ReturnType<NodeActions["itemEntries"]>;
 }
 
-function RenameInput({ node, onDone }: { node: LibraryNode; onDone: (name: string | null) => void }) {
+/**
+ * `onCloseAutoFocus` for a right-click menu over items that can be renamed inline. The menu keeps
+ * focus while its "Rename" entry mounts the input, so hand focus to the input once the menu closes.
+ */
+export function focusRenameInput(e: Event, container: HTMLElement | null) {
+  const input = container?.querySelector<HTMLInputElement>(".rename-input");
+  if (!input) return;
+  e.preventDefault();
+  input.focus();
+  input.select();
+}
+
+function RenameInput({
+  node,
+  onDone,
+}: {
+  node: LibraryNode;
+  onDone: (name: string | null, refocus: boolean) => void;
+}) {
   const ref = useRef<HTMLInputElement>(null);
   const done = useRef(false);
   useEffect(() => {
@@ -50,10 +70,10 @@ function RenameInput({ node, onDone }: { node: LibraryNode; onDone: (name: strin
       input.select();
     }
   }, []);
-  const finish = (value: string | null) => {
+  const finish = (value: string | null, refocus: boolean) => {
     if (done.current) return;
     done.current = true;
-    onDone(value);
+    onDone(value, refocus);
   };
   return (
     <input
@@ -64,19 +84,30 @@ function RenameInput({ node, onDone }: { node: LibraryNode; onDone: (name: strin
       aria-label="New name"
       onKeyDown={(e) => {
         e.stopPropagation();
-        if (e.key === "Enter") finish(e.currentTarget.value.trim() || null);
-        if (e.key === "Escape") finish(null);
+        if (isImeKey(e.nativeEvent)) return;
+        if (e.key === "Enter") finish(e.currentTarget.value.trim() || null, true);
+        if (e.key === "Escape") finish(null, true);
       }}
-      onBlur={(e) => finish(e.currentTarget.value.trim() || null)}
+      onBlur={(e) => {
+        // Switching to another window or tab blurs the input too; keep editing until the user is back.
+        if (!document.hasFocus()) return;
+        // Leave focus where the user put it (e.g. the search box); refocus the list only if it went nowhere.
+        finish(e.currentTarget.value.trim() || null, e.relatedTarget === null);
+      }}
       onClick={(e) => e.stopPropagation()}
       onDoubleClick={(e) => e.stopPropagation()}
       onPointerDown={(e) => e.stopPropagation()}
+      // Keep the browser's own menu (paste, spelling) instead of the item menu around the input.
+      onContextMenu={(e) => e.stopPropagation()}
     />
   );
 }
 
 function MoreButton({ node, props }: { node: LibraryNode; props: ItemViewProps }) {
   const [open, setOpen] = useState(false);
+  // Radix opens the menu on pointerdown, also when a touch swipe to scroll starts on the button.
+  // Touch and pen open it on the tap (click) instead, without selecting the item.
+  const tap = useRef<"open" | "close" | null>(null);
   const targets = props.selection.selected.has(node.id)
     ? props.items.filter((i) => props.selection.selected.has(i.id))
     : [node];
@@ -94,9 +125,19 @@ function MoreButton({ node, props }: { node: LibraryNode; props: ItemViewProps }
         <button
           className="item-more icon-btn icon-btn-sm"
           aria-label={`Actions for ${node.name}`}
-          onClick={(e) => e.stopPropagation()}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (tap.current && e.detail > 0) setOpen(tap.current === "open");
+            tap.current = null;
+          }}
           onDoubleClick={(e) => e.stopPropagation()}
-          onPointerDown={(e) => e.stopPropagation()}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+            tap.current = e.pointerType === "mouse" ? null : open ? "close" : "open";
+            // Skips Radix's own pointerdown handler.
+            if (tap.current) e.preventDefault();
+          }}
+          onPointerCancel={() => (tap.current = null)}
         >
           <MoreHorizontal />
         </button>
@@ -171,13 +212,24 @@ function useItemBehavior(node: LibraryNode, props: ItemViewProps) {
         let ids = [node.id];
         if (selected) ids = props.items.filter((i) => selection.selected.has(i.id)).map((i) => i.id);
         else selection.selectOnly(node.id);
-        const folderIds = props.items.filter((i) => ids.includes(i.id) && i.kind === "folder").map((i) => i.id);
-        startNodeDrag(e, ids, folderIds, props.folderId, ids.length === 1 ? node.name : plural(ids.length, "item"));
+        const dragged = props.items.filter((i) => ids.includes(i.id));
+        const folderIds = dragged.filter((i) => i.kind === "folder").map((i) => i.id);
+        const origins = new Map(dragged.map((i) => [i.id, i.parent_id]));
+        startNodeDrag(e, ids, folderIds, origins, ids.length === 1 ? node.name : plural(ids.length, "item"));
       },
       onDragEnd: () => endNodeDrag(),
       ...dropProps,
     },
   };
+}
+
+/**
+ * For the item checkboxes: focus the list instead, as a click elsewhere on the item does. A focused
+ * checkbox counts as a text field for the list's shortcuts, and it unmounts when its item is deselected.
+ */
+function keepListFocus(e: React.MouseEvent) {
+  e.preventDefault();
+  e.currentTarget.closest<HTMLElement>(".explorer-content")?.focus({ preventScroll: true });
 }
 
 function Visual({ node }: { node: LibraryNode }) {
@@ -224,12 +276,13 @@ const Tile = memo(function Tile({ node, props }: { node: LibraryNode; props: Ite
           readOnly
           tabIndex={-1}
           aria-label={`Select ${node.name}`}
+          onMouseDown={keepListFocus}
         />
       )}
       <Visual node={node} />
       <div className="tile-name">
         {props.renamingId === node.id ? (
-          <RenameInput node={node} onDone={(name) => props.onRenameDone(node.id, name)} />
+          <RenameInput node={node} onDone={(name, refocus) => props.onRenameDone(node.id, name, refocus)} />
         ) : (
           <span className="clamp-2">{node.name}</span>
         )}
@@ -256,11 +309,19 @@ const Row = memo(function Row({ node, props }: { node: LibraryNode; props: ItemV
     >
       <div className="cell name">
         {props.touch && (
-          <input type="checkbox" className="item-check" checked={selected} readOnly tabIndex={-1} aria-label={`Select ${node.name}`} />
+          <input
+            type="checkbox"
+            className="item-check"
+            checked={selected}
+            readOnly
+            tabIndex={-1}
+            aria-label={`Select ${node.name}`}
+            onMouseDown={keepListFocus}
+          />
         )}
         <NodeGlyph kind={node.kind} color={node.color} size={22} />
         {props.renamingId === node.id ? (
-          <RenameInput node={node} onDone={(name) => props.onRenameDone(node.id, name)} />
+          <RenameInput node={node} onDone={(name, refocus) => props.onRenameDone(node.id, name, refocus)} />
         ) : (
           <span className="truncate" title={node.name}>
             {node.name}

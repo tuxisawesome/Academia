@@ -20,6 +20,8 @@ export interface RequestOptions {
   headers?: Record<string, string>;
   signal?: AbortSignal;
   query?: Record<string, string | number | boolean | null | undefined>;
+  /** Lets the request finish after the page is closed. */
+  keepalive?: boolean;
 }
 
 export function apiUrl(path: string, query?: RequestOptions["query"]): string {
@@ -28,6 +30,18 @@ export function apiUrl(path: string, query?: RequestOptions["query"]): string {
     if (value !== undefined && value !== null && value !== "") url.searchParams.set(key, String(value));
   }
   return url.pathname + url.search;
+}
+
+let sessionEnded: () => void = () => {};
+
+/** Registers what happens when any request (query, action or upload) finds the session gone. */
+export function setSessionEndedHandler(handler: () => void): void {
+  sessionEnded = handler;
+}
+
+/** Signs the tab out when the server says the session has ended (expired, revoked or disabled). */
+export function checkSession(status: number, code: string | undefined): void {
+  if (status === 401 && code === "unauthenticated") sessionEnded();
 }
 
 async function errorFrom(res: Response): Promise<ApiError> {
@@ -51,7 +65,7 @@ async function errorFrom(res: Response): Promise<ApiError> {
 }
 
 export async function api<T = unknown>(path: string, options: RequestOptions = {}): Promise<T> {
-  const { method = "GET", json, body, headers = {}, signal, query } = options;
+  const { method = "GET", json, body, headers = {}, signal, query, keepalive } = options;
   let res: Response;
   try {
     res = await fetch(apiUrl(path, query), {
@@ -64,6 +78,7 @@ export async function api<T = unknown>(path: string, options: RequestOptions = {
       },
       body: json !== undefined ? JSON.stringify(json) : body,
       signal,
+      keepalive,
     });
   } catch (err) {
     if ((err as Error).name === "AbortError") throw err;
@@ -74,7 +89,11 @@ export async function api<T = unknown>(path: string, options: RequestOptions = {
   if (res.status === 502 || res.status === 503 || res.status === 504) {
     if (!res.headers.get("X-App-Version")) reportServerUnavailable();
   }
-  if (!res.ok) throw await errorFrom(res);
+  if (!res.ok) {
+    const err = await errorFrom(res);
+    checkSession(err.status, err.code);
+    throw err;
+  }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }
@@ -87,6 +106,18 @@ export function errorMessage(err: unknown): string {
   if (err instanceof ApiError) return err.message;
   if (err instanceof Error) return err.message;
   return "Something went wrong.";
+}
+
+export function isNotFound(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 404;
+}
+
+/**
+ * Whether a query's error should replace the page: nothing has loaded yet, or the item is gone.
+ * A failed background refetch (window focus, invalidation) keeps showing the data already loaded.
+ */
+export function isPageError(error: unknown, hasData: boolean): boolean {
+  return !!error && (!hasData || isNotFound(error));
 }
 
 /** Starts a file download from a same-origin URL (the server sets Content-Disposition). */

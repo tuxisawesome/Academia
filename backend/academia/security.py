@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import math
+import os
 import secrets
 import string
 import threading
@@ -21,6 +23,10 @@ from .models import Session, User, utcnow
 
 _hasher = PasswordHasher()
 
+# Each Argon2 hash or verification needs 64 MiB and several CPU threads. Bound how many run
+# at once so a burst of sign-in attempts cannot exhaust the server's memory.
+_argon2_slots = threading.BoundedSemaphore(max(1, min(4, os.cpu_count() or 1)))
+
 SECURE_COOKIE = "__Host-academia"
 PLAIN_COOKIE = "academia_session"
 MIN_PASSWORD_LENGTH = 10
@@ -30,12 +36,14 @@ TOUCH_INTERVAL = timedelta(minutes=10)
 
 
 def hash_password(password: str) -> str:
-    return _hasher.hash(password)
+    with _argon2_slots:
+        return _hasher.hash(password)
 
 
 def verify_password(password_hash: str, password: str) -> bool:
     try:
-        return _hasher.verify(password_hash, password)
+        with _argon2_slots:
+            return _hasher.verify(password_hash, password)
     except (VerifyMismatchError, VerificationError, InvalidHashError):
         return False
 
@@ -105,12 +113,18 @@ def revoke_user_sessions(db: DbSession, user_id: str, except_session_id: str | N
 
 
 class LoginRateLimiter:
-    """Sliding-window limits on failed logins, per client IP and per username."""
+    """Sliding-window limits on failed logins, per username and per client IP.
 
-    def __init__(self, per_ip: int = 20, per_user: int = 8, window_s: int = 900) -> None:
+    The per-username limit is enforced before the password is checked. The per-IP limit is
+    shared by everyone behind one address (a school's NAT, or every client when the app sits
+    behind a tunnel), so it only turns away wrong passwords and never a correct one.
+    """
+
+    def __init__(self, per_ip: int = 20, per_user: int = 8, window_s: int = 900, max_buckets: int = 10000) -> None:
         self.per_ip = per_ip
         self.per_user = per_user
         self.window = window_s
+        self.max_buckets = max_buckets
         self._ip: dict[str, deque[float]] = {}
         self._user: dict[str, deque[float]] = {}
         self._lock = threading.Lock()
@@ -121,31 +135,53 @@ class LoginRateLimiter:
             q.popleft()
         return q
 
-    def check(self, ip: str, username: str) -> None:
+    def _bound(self, bucket: dict[str, deque[float]], now: float) -> None:
+        """Keep memory bounded when someone sprays usernames or addresses.
+
+        Expired buckets go first, then those with the fewest failures. Clearing everything
+        instead would also wipe the count of an account that is being guessed at.
+        """
+        if len(bucket) <= self.max_buckets:
+            return
+        for key in [k for k, q in bucket.items() if not q or q[-1] <= now - self.window]:
+            del bucket[key]
+        if len(bucket) > self.max_buckets:
+            for key in sorted(bucket, key=lambda k: len(bucket[k]))[: len(bucket) - self.max_buckets // 2]:
+                del bucket[key]
+
+    def _limit(self, q: deque[float], limit: int, now: float) -> None:
+        if len(q) >= limit:
+            # The bucket drops below its limit once its limit-th newest entry expires.
+            wait = max(1, math.ceil((q[-limit] + self.window - now) / 60))
+            raise TooManyRequests(
+                f"Too many failed sign-in attempts. Try again in about {wait} minute{'' if wait == 1 else 's'}.",
+                code="rate_limited",
+            )
+
+    def check(self, username: str) -> None:
+        """Start an attempt for ``username``, or raise 429 if it has failed too often.
+
+        The attempt counts as failed until ``success()``, so concurrent guesses can't all
+        get past the limit before the first of them is verified.
+        """
+        now = time.monotonic()
+        with self._lock:
+            user_q = self._prune(self._user, username.lower(), now)
+            self._limit(user_q, self.per_user, now)
+            user_q.append(now)
+            self._bound(self._user, now)
+
+    def failure(self, ip: str) -> None:
+        """Record a wrong password from ``ip``; raise 429 if that address was already over its limit."""
         now = time.monotonic()
         with self._lock:
             ip_q = self._prune(self._ip, ip, now)
-            user_q = self._prune(self._user, username.lower(), now)
-            if len(ip_q) >= self.per_ip or len(user_q) >= self.per_user:
-                oldest = min([q[0] for q in (ip_q, user_q) if q], default=now)
-                wait = int(max(1, oldest + self.window - now) // 60) + 1
-                raise TooManyRequests(
-                    f"Too many failed sign-in attempts. Try again in about {wait} minutes.",
-                    code="rate_limited",
-                )
-
-    def failure(self, ip: str, username: str) -> None:
-        now = time.monotonic()
-        with self._lock:
-            self._prune(self._ip, ip, now).append(now)
-            self._prune(self._user, username.lower(), now).append(now)
-            # Keep memory bounded if someone sprays usernames.
-            if len(self._user) > 10000:
-                self._user.clear()
-            if len(self._ip) > 10000:
-                self._ip.clear()
+            self._limit(ip_q, self.per_ip, now)
+            ip_q.append(now)
+            self._bound(self._ip, now)
 
     def success(self, username: str) -> None:
+        """Forget the failed attempts for ``username`` (correct password or admin reset)."""
         with self._lock:
             self._user.pop(username.lower(), None)
 

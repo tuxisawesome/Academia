@@ -2,28 +2,32 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import os
 import re
 import threading
 import unicodedata
+import uuid
 import zipfile
 from collections import defaultdict
+from concurrent.futures import CancelledError
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import func, select
 
 from ..config import get_settings
 from ..db import read_session, write_session
 from ..errors import BadRequest, NotFound
-from ..models import BOOKMARK, FOLDER, NOTEBOOK, Job, Node, Page, Source, utcnow
+from ..models import BOOKMARK, FOLDER, NOTEBOOK, BookmarkPage, Job, Node, Page, Source, utcnow
 from ..storage import export_path, free_bytes, pdf_cache_path, source_path, tmp_dir
 from ..workers import pdfops, pool
 from .bookmarks import require_bookmark
-from .common import segments
+from .common import segments, unwanted_in_name
 from .describe import bookmark_members
 from .pdfbuild import bookmark_spec, notebook_spec, spec_digest
 
@@ -34,15 +38,18 @@ _RESERVED = {"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)), *(f
 
 
 def safe_filename(name: str, limit: int = 150) -> str:
-    """A file name that is valid on Windows, macOS and Linux."""
+    """A file name that is valid on Windows, macOS and Linux, and not hidden.
+
+    ``limit`` is in UTF-8 bytes: Linux and macOS allow at most 255 bytes per name.
+    """
     name = unicodedata.normalize("NFC", name or "")
-    name = "".join("_" if (unicodedata.category(c)[0] == "C" or c in '<>:"/\\|?*') else c for c in name)
-    name = re.sub(r"\s+", " ", name).strip().rstrip(". ")
+    name = "".join("_" if (unwanted_in_name(c) or c in '<>:"/\\|?*') else c for c in name)
+    name = re.sub(r"\s+", " ", name).strip(". ")
     if not name:
         name = "Untitled"
     if name.split(".")[0].upper() in _RESERVED:
         name = f"_{name}"
-    return name[:limit].rstrip(". ") or "Untitled"
+    return name.encode()[:limit].decode(errors="ignore").rstrip(". ") or "Untitled"
 
 
 def job_json(job: Job) -> dict[str, Any]:
@@ -100,12 +107,15 @@ def latest_jobs(user_id: str, limit: int = 5) -> list[dict[str, Any]]:
         return [job_json(j) for j in jobs]
 
 
-def _update(job_id: str, **values: Any) -> None:
+def _update(job_id: str, **values: Any) -> bool:
+    """Returns False if the job no longer exists (its owner was deleted)."""
     with write_session() as db:
         job = db.get(Job, job_id)
-        if job is not None:
-            for key, value in values.items():
-                setattr(job, key, value)
+        if job is None:
+            return False
+        for key, value in values.items():
+            setattr(job, key, value)
+        return True
 
 
 def _plan(db, user_id: str, bookmark_pdfs: bool) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:  # noqa: ANN001
@@ -170,15 +180,60 @@ def _plan(db, user_id: str, bookmark_pdfs: bool) -> tuple[list[dict[str, Any]], 
 
 
 def _estimate_bytes(db, user_id: str, bookmark_pdfs: bool) -> int:  # noqa: ANN001
+    """Roughly the size of the archive: each exported page costs its share of its source file,
+    once per notebook (copies share sources) and once more per bookmark PDF it is in."""
+    share = func.coalesce(func.sum(Source.byte_size * 1.0 / func.max(Source.page_count, 1)), 0)
     total = (
         db.scalar(
-            select(func.coalesce(func.sum(Source.byte_size), 0)).where(
-                Source.owner_id == user_id, Source.id.in_(select(Page.source_id).distinct())
-            )
+            select(share)
+            .select_from(Page)
+            .join(Source, Source.id == Page.source_id)
+            .join(Node, Node.id == Page.notebook_id)
+            .where(Node.owner_id == user_id, Node.trashed_at.is_(None), Page.deleted_at.is_(None))
         )
         or 0
     )
-    return int(total * (1.6 if bookmark_pdfs else 1.1)) + 64 * 1024 * 1024
+    if bookmark_pdfs:
+        total += (
+            db.scalar(
+                select(share)
+                .select_from(BookmarkPage)
+                .join(Page, Page.id == BookmarkPage.page_id)
+                .join(Source, Source.id == Page.source_id)
+                .join(Node, Node.id == BookmarkPage.bookmark_id)
+                .where(Node.owner_id == user_id, Node.trashed_at.is_(None), Page.deleted_at.is_(None))
+            )
+            or 0
+        )
+    return int(total * 1.1) + 64 * 1024 * 1024
+
+
+def _write_pdf(zf: zipfile.ZipFile, job_id: str, user_id: str, spec: dict[str, Any], arcname: str) -> bool:
+    """Add the PDF for ``spec`` to the archive. Returns False if it can't be built (e.g. a damaged
+    source file), so that one broken notebook doesn't stop the rest of the export."""
+    cached = pdf_cache_path(user_id, spec_digest(spec))
+    if cached.exists():
+        zf.write(cached, arcname)
+        return True
+    # A unique name: a build that timed out may still finish later and must not land on the
+    # file of the next entry.
+    tmp = tmp_dir() / f"export-{job_id}-{uuid.uuid4().hex}.pdf"
+    resolved = dict(spec)
+    resolved["pages"] = [[str(source_path(s)), i, r] for s, i, r in spec["pages"]]
+    try:
+        try:
+            pool.run(pdfops.assemble, resolved, str(tmp))
+        except Exception as exc:  # noqa: BLE001
+            if isinstance(exc, CancelledError) or (
+                isinstance(exc, OSError) and exc.errno in (errno.ENOSPC, errno.EDQUOT)
+            ):
+                raise  # the disk is full or the server is stopping: the whole export fails
+            log.exception("Export %s: could not build %s", job_id, arcname)
+            return False
+        zf.write(tmp, arcname)
+        return True
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def run_export(job_id: str) -> None:
@@ -203,6 +258,8 @@ def run_export(job_id: str) -> None:
         files = [e for e in entries if e["kind"] != FOLDER]
         _update(job_id, status="running", total=len(files), progress=0, message="Building PDFs…")
 
+        items = {item["id"]: item for item in manifest_items}
+        failed: list[str] = []
         done = 0
         with zipfile.ZipFile(part, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as zf:
             for entry in entries:
@@ -218,19 +275,14 @@ def run_export(job_id: str) -> None:
                             _, _, spec = bookmark_spec(db, user_id, entry["id"], with_outline=embed)
                     except NotFound:
                         spec = None
-                if spec and spec["pages"]:
-                    cached = pdf_cache_path(spec_digest(spec))
-                    if cached.exists():
-                        zf.write(cached, entry["path"])
-                    else:
-                        tmp = tmp_dir() / f"export-{job_id}-{done}.pdf"
-                        resolved = dict(spec)
-                        resolved["pages"] = [[str(source_path(s)), i, r] for s, i, r in spec["pages"]]
-                        try:
-                            pool.run(pdfops.assemble, resolved, str(tmp))
-                            zf.write(tmp, entry["path"])
-                        finally:
-                            tmp.unlink(missing_ok=True)
+                # The manifest only gives paths of files that are in the archive.
+                item = items[entry["id"]]
+                if not spec or not spec["pages"]:
+                    item["path"] = None  # empty, or a bookmark into a notebook in the Trash
+                elif not _write_pdf(zf, job_id, user_id, spec, entry["path"]):
+                    item["path"] = None
+                    item["error"] = "The PDF could not be built."
+                    failed.append(entry["path"].removeprefix("Academia/"))
                 done += 1
                 _update(job_id, progress=done, message=f"Added {entry['path'].removeprefix('Academia/')}"[:250])
             manifest = {
@@ -247,15 +299,18 @@ def run_export(job_id: str) -> None:
             )
         os.replace(part, final)
         now = utcnow()
-        _update(
+        updated = _update(
             job_id,
             status="done",
             message="Ready to download.",
+            error=f"Not included (could not be built): {', '.join(failed)}"[:1000] if failed else None,
             result_path=str(final),
             result_size=final.stat().st_size,
             finished_at=now,
             expires_at=now + timedelta(hours=settings.export_ttl_hours),
         )
+        if not updated:
+            final.unlink(missing_ok=True)  # the user was deleted meanwhile
     except Exception as exc:  # noqa: BLE001
         log.exception("Export %s failed", job_id)
         part.unlink(missing_ok=True)
@@ -263,11 +318,17 @@ def run_export(job_id: str) -> None:
         _update(job_id, status="failed", error=str(message)[:1000], message="Failed.", finished_at=utcnow())
 
 
-def export_file(user_id: str, job_id: str) -> tuple[Path, str]:
+def export_file(user_id: str, job_id: str, tz: str | None = None) -> tuple[Path, str]:
+    """The archive and its download name, dated in the user's time zone ``tz`` (IANA name)."""
     job = get_job(user_id, job_id)
     if job.status != "done" or not job.result_path or not Path(job.result_path).exists():
         raise NotFound("This export is no longer available.")
-    stamp = job.created_at.strftime("%Y-%m-%d")
+    created = job.created_at
+    try:
+        created = created.astimezone(ZoneInfo(tz)) if tz else created
+    except (KeyError, ValueError, OSError):  # unknown or malformed zone name: keep UTC
+        pass
+    stamp = created.strftime("%Y-%m-%d")
     return Path(job.result_path), f"Academia export {stamp}.zip"
 
 
@@ -277,3 +338,4 @@ def fail_interrupted_jobs() -> None:
             job.status = "failed"
             job.error = "Interrupted by a server restart. Please start the export again."
             job.finished_at = utcnow()
+            export_path(job.id).with_suffix(".zip.part").unlink(missing_ok=True)

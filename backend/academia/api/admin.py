@@ -69,7 +69,7 @@ def update_user(user_id: str, body: UpdateUserBody, admin: AdminUser, db: Db) ->
 def delete_user(user_id: str, admin: AdminUser, db: Db) -> dict[str, bool]:
     if db.get(User, user_id) is None:
         raise NotFound("User not found.")
-    source_ids = users_service.delete_user(db, admin, user_id)
+    source_ids, job_ids = users_service.delete_user(db, admin, user_id)
     db.commit()
-    users_service.remove_files(source_ids)
+    users_service.remove_files(user_id, source_ids, job_ids)
     return {"ok": True}

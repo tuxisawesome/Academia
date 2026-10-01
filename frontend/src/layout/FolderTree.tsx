@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
-import { NavLink, useMatch, useNavigate } from "react-router";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { NavLink, useMatch } from "react-router";
 import { ChevronRight, Library } from "lucide-react";
-import { copyNodes, moveNodes } from "../api/actions";
+import { copyNodes, moveBack, moveNodes } from "../api/actions";
 import { useTree } from "../api/queries";
 import type { TreeFolder } from "../api/types";
 import { FolderGlyph } from "../components/Glyphs";
@@ -41,6 +41,26 @@ export function buildTree(folders: TreeFolder[]): { roots: TreeNode[]; byId: Map
   return { roots, byId };
 }
 
+/**
+ * The folders to expand so `current` shows in the tree, keyed by its place in the tree; null when
+ * that place was already revealed (`revealedKey`), so folders collapsed since then stay collapsed.
+ */
+export function revealPlan(
+  byId: Map<string, TreeFolder>,
+  current: string,
+  revealedKey: string | undefined,
+): { key: string; open: string[] } | null {
+  let node = byId.get(current);
+  if (!node) return null;
+  const open: string[] = [];
+  while (node?.parent_id) {
+    open.push(node.parent_id);
+    node = byId.get(node.parent_id);
+  }
+  const key = [current, ...open].join("/");
+  return key === revealedKey ? null : { key, open };
+}
+
 /** Handlers that make an element a drop target for library items and desktop files. */
 export function useFolderDrop(folderId: string | null, folderName: string) {
   const [over, setOver] = useState(false);
@@ -48,7 +68,7 @@ export function useFolderDrop(folderId: string | null, folderName: string) {
     over,
     props: {
       onDragOver: (e: React.DragEvent) => {
-        if (isNodeDrag(e) ? canDropInto(folderId) && currentDrag()?.fromFolder !== folderId : isFileDrag(e)) {
+        if (isNodeDrag(e) ? canDropInto(folderId) : isFileDrag(e)) {
           e.preventDefault();
           e.dataTransfer.dropEffect = isNodeDrag(e) ? dropEffect(e) : "copy";
           if (!over) setOver(true);
@@ -62,7 +82,7 @@ export function useFolderDrop(folderId: string | null, folderName: string) {
           e.stopPropagation();
           const ids: string[] = JSON.parse(e.dataTransfer.getData(NODE_MIME) || "[]");
           const copy = dropEffect(e) === "copy";
-          const from = currentDrag()?.fromFolder ?? null;
+          const origins = currentDrag()?.origins ?? new Map<string, string | null>();
           endNodeDrag();
           try {
             if (copy) {
@@ -71,7 +91,7 @@ export function useFolderDrop(folderId: string | null, folderName: string) {
             } else {
               await moveNodes(ids, folderId);
               toast(`Moved ${plural(ids.length, "item")} to ${folderName}.`, {
-                action: { label: "Undo", onClick: () => void moveNodes(ids, from).catch(toastError) },
+                action: { label: "Undo", onClick: () => void moveBack(origins).catch(toastError) },
               });
             }
           } catch (err) {
@@ -100,7 +120,6 @@ function TreeItem({
 }) {
   const open = expanded.has(node.id);
   const drop = useFolderDrop(node.id, node.name);
-  const navigate = useNavigate();
   return (
     <li role="treeitem" aria-expanded={node.children.length ? open : undefined} aria-selected={false}>
       <div className={`tree-row ${drop.over ? "drop-over" : ""}`} style={{ paddingLeft: 6 + depth * 14 }} {...drop.props}>
@@ -120,7 +139,6 @@ function TreeItem({
           onKeyDown={(e) => {
             if (e.key === "ArrowRight" && !open && node.children.length) toggle(node.id);
             if (e.key === "ArrowLeft" && open) toggle(node.id);
-            if (e.key === "Enter") navigate(`/f/${node.id}`);
           }}
         >
           <FolderGlyph color={node.color} size={18} open={open} />
@@ -146,17 +164,18 @@ export function FolderTree() {
   const { roots, byId } = useMemo(() => buildTree(folders ?? []), [folders]);
   const rootDrop = useFolderDrop(null, "Library");
 
-  // Reveal the current folder.
+  // Reveal the current folder when it is opened (or moved), not on every change to the tree.
+  const revealed = useRef<string>(undefined);
   useEffect(() => {
-    if (!current || !byId.size) return;
-    let node = byId.get(current);
-    const toOpen: string[] = [];
-    while (node?.parent_id) {
-      toOpen.push(node.parent_id);
-      node = byId.get(node.parent_id);
+    if (!current) {
+      revealed.current = undefined;
+      return;
     }
-    if (toOpen.some((id) => !expanded.has(id))) {
-      setExpanded((prev) => new Set([...prev, ...toOpen]));
+    const plan = revealPlan(byId, current, revealed.current);
+    if (!plan) return;
+    revealed.current = plan.key;
+    if (plan.open.some((id) => !expanded.has(id))) {
+      setExpanded((prev) => new Set([...prev, ...plan.open]));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [current, byId]);

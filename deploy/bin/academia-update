@@ -22,19 +22,44 @@ if ! flock -n 9; then
   exit 1
 fi
 
+# update.sh always runs from a fresh copy of the repository's deploy/ in $work, never from a
+# release directory: older installers let the build's dependencies write to those.
+work=$(mktemp -d /tmp/academia-update.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+
+installed_deploy() { # deploy/ of the version installed now, for --help and --rollback
+  [[ -L $CURRENT ]] || {
+    echo "Academia doesn't seem to be installed here." >&2
+    exit 1
+  }
+  local commit
+  commit=$(basename "$(readlink -f "$CURRENT")")
+  if ! git -C "$SRC_DIR" archive "$commit" deploy 2>/dev/null | tar -x -C "$work" 2>/dev/null; then
+    # That version is no longer in the repository (for example after a force push).
+    rm -rf "$work/deploy"
+    cp -r "$CURRENT/deploy" "$work/deploy"
+  fi
+}
+
 ref="" rollback=0 args=()
 while (($#)); do
   case $1 in
     --ref) ref=${2:?--ref needs a branch, tag or commit}; shift ;;
     --rollback) rollback=1; args+=("$1") ;;
-    -h | --help) exec bash "$CURRENT/deploy/update.sh" --help ;;
+    -h | --help)
+      installed_deploy
+      bash "$work/deploy/update.sh" --help
+      exit
+      ;;
     *) args+=("$1") ;;
   esac
   shift
 done
 
 if [[ $rollback -eq 1 ]]; then
-  exec bash "$CURRENT/deploy/update.sh" "${args[@]}"
+  installed_deploy
+  bash "$work/deploy/update.sh" "${args[@]}"
+  exit
 fi
 
 [[ -f $CONF_FILE && -d $SRC_DIR/.git ]] || {
@@ -45,7 +70,11 @@ branch=$(sed -n 's/^BRANCH="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CONF_FILE" | tail 
 target=${ref:-${branch:-main}}
 
 echo "Checking for updates…"
-git -C "$SRC_DIR" fetch --prune --tags --quiet origin
+# --force: a tag that was moved upstream would otherwise make every later fetch fail.
+if ! git -C "$SRC_DIR" fetch --prune --tags --force --quiet origin; then
+  echo "Couldn't fetch updates from the repository (see the git message above)." >&2
+  exit 1
+fi
 
 commit=""
 for candidate in "origin/$target" "refs/tags/$target" "$target"; do
@@ -57,7 +86,5 @@ if [[ -z $commit ]]; then
   exit 1
 fi
 
-work=$(mktemp -d /tmp/academia-update.XXXXXX)
-trap 'rm -rf "$work"' EXIT
 git -C "$SRC_DIR" archive "$commit" deploy | tar -x -C "$work"
 bash "$work/deploy/update.sh" --commit "$commit" "${args[@]}"

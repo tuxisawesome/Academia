@@ -1,6 +1,6 @@
 import { Dialog } from "radix-ui";
 import { Check, ChevronLeft, ChevronRight, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import type { PageRef } from "../../api/types";
 import { PageThumb } from "../../components/PageThumb";
 
@@ -22,24 +22,27 @@ export function PagePreview({
   selected?: Set<string>;
   onToggle?: (pageId: string) => void;
 }) {
-  const boxRef = useRef<HTMLDivElement>(null);
+  // The body sits in a portal that mounts after this component, so measure it once it attaches.
+  const [boxEl, setBoxEl] = useState<HTMLDivElement | null>(null);
   const [box, setBox] = useState({ w: 600, h: 800 });
   const page = pages[index];
 
-  useEffect(() => {
-    const el = boxRef.current;
+  useLayoutEffect(() => {
+    const el = boxEl;
     if (!el) return;
     const update = () => setBox({ w: el.clientWidth - 24, h: el.clientHeight - 24 });
     update();
     const ro = new ResizeObserver(update);
     ro.observe(el);
     return () => ro.disconnect();
-  }, []);
+  }, [boxEl]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "ArrowRight" && index < pages.length - 1) onIndexChange(index + 1);
       if (e.key === "ArrowLeft" && index > 0) onIndexChange(index - 1);
+      // Space/Enter on one of the dialog's buttons presses that button instead.
+      if ((e.target as HTMLElement).closest?.("button, input, a")) return;
       if ((e.key === " " || e.key === "Enter") && onToggle) {
         e.preventDefault();
         onToggle(page.id);
@@ -76,7 +79,7 @@ export function PagePreview({
               </button>
             </Dialog.Close>
           </div>
-          <div className="preview-body" ref={boxRef}>
+          <div className="preview-body" ref={setBoxEl}>
             <button
               className="preview-nav prev"
               aria-label="Previous page"

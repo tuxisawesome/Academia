@@ -19,6 +19,14 @@ export interface Prefs {
   reader: { layout: "auto" | "single" | "double"; cover_alone: boolean };
 }
 
+/** A preferences update: only the fields that changed (the server merges `sort` and `reader`). */
+export interface PrefsPatch {
+  theme?: Prefs["theme"];
+  view?: Prefs["view"];
+  sort?: Partial<Prefs["sort"]>;
+  reader?: Partial<Prefs["reader"]>;
+}
+
 export type SortKey = "name" | "modified" | "type" | "pages";
 
 export interface User {
@@ -119,6 +127,8 @@ export interface NotebookDetail extends LibraryNode {
   path: PathEntry[];
   pages: PageRef[];
   bookmarks: NotebookBookmark[];
+  /** Digest of the reader PDF; null while the notebook is in the Trash. */
+  pdf_digest: string | null;
   deleted_batch?: string;
   inserted_page_ids?: string[];
 }
@@ -132,6 +142,8 @@ export interface BookmarkDetail extends LibraryNode {
   pages: BookmarkPage[];
   segments: [number, number][];
   label: string;
+  /** Digest of the reader PDF; null while it cannot be read (in the Trash). */
+  pdf_digest: string | null;
 }
 
 export interface UploadedSource {

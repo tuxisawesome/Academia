@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { ChevronRight, FolderPlus, Library, Search } from "lucide-react";
 import { createFolder } from "../../api/actions";
 import { useAllNotebooks, useNode, useTree } from "../../api/queries";
@@ -6,7 +6,7 @@ import type { LibraryNode } from "../../api/types";
 import { FolderGlyph, NodeGlyph } from "../../components/Glyphs";
 import { Modal } from "../../components/Modal";
 import { PageThumb } from "../../components/PageThumb";
-import { formatDateLong, plural } from "../../lib/format";
+import { compareNames, formatDateLong, plural } from "../../lib/format";
 import { promptDialog } from "../../state/dialogs";
 import { toastError } from "../../state/toasts";
 import { buildTree, type TreeNode } from "../../layout/FolderTree";
@@ -21,6 +21,7 @@ function PickerRow({
   disabled,
   expanded,
   toggle,
+  active,
 }: {
   node: TreeNode;
   depth: number;
@@ -29,6 +30,8 @@ function PickerRow({
   disabled: Set<string>;
   expanded: Set<string>;
   toggle: (id: string) => void;
+  /** The row that takes Tab focus. */
+  active: string | null;
 }) {
   const isDisabled = disabled.has(node.id);
   const open = expanded.has(node.id);
@@ -38,18 +41,23 @@ function PickerRow({
         className={`picker-row ${value === node.id ? "selected" : ""} ${isDisabled ? "disabled" : ""}`}
         style={{ paddingLeft: 8 + depth * 16 }}
         role="treeitem"
+        aria-level={depth + 1}
+        aria-expanded={node.children.length ? open : undefined}
         aria-selected={value === node.id}
         aria-disabled={isDisabled}
+        tabIndex={active === node.id ? 0 : -1}
+        data-picker-id={node.id}
         onClick={() => !isDisabled && onChange(node.id)}
       >
         <button
           className={`tree-toggle ${open ? "open" : ""}`}
           style={{ visibility: node.children.length ? "visible" : "hidden" }}
+          tabIndex={-1}
           onClick={(e) => {
             e.stopPropagation();
             toggle(node.id);
           }}
-          aria-label={open ? "Collapse" : "Expand"}
+          aria-label={`${open ? "Collapse" : "Expand"} ${node.name}`}
         >
           <ChevronRight size={14} />
         </button>
@@ -67,10 +75,22 @@ function PickerRow({
             disabled={disabled}
             expanded={expanded}
             toggle={toggle}
+            active={active}
           />
         ))}
     </>
   );
+}
+
+/** The picker's rows in display order: the Library (null), then each folder whose parents are expanded. */
+export function visibleRows(roots: TreeNode[], expanded: Set<string>): (TreeNode | null)[] {
+  const out: (TreeNode | null)[] = [null];
+  const walk = (n: TreeNode) => {
+    out.push(n);
+    if (expanded.has(n.id)) n.children.forEach(walk);
+  };
+  roots.forEach(walk);
+  return out;
 }
 
 /** Picks a destination folder (null = Library root). Folders in `excludeIds` (and inside them) can't be chosen. */
@@ -106,13 +126,57 @@ export function FolderPicker({
       return next;
     });
 
+  // Keyboard: one row is in the Tab order; arrows move between rows and open or close folders.
+  const treeRef = useRef<HTMLDivElement>(null);
+  const [focusId, setFocusId] = useState<string | null>(value);
+  const rows = visibleRows(roots, expanded);
+  const active = rows.some((r) => (r?.id ?? null) === focusId) ? focusId : null;
+  const focusRow = (id: string | null) => {
+    setFocusId(id);
+    treeRef.current?.querySelector<HTMLElement>(`[data-picker-id="${id ?? ""}"]`)?.focus();
+  };
+  const choose = (id: string | null) => {
+    setFocusId(id);
+    onChange(id);
+  };
+  const onKeyDown = (e: React.KeyboardEvent) => {
+    // The focused row (clicks focus rows too), else the one in the Tab order.
+    const focused = (e.target as HTMLElement).closest<HTMLElement>("[data-picker-id]")?.dataset.pickerId;
+    const current = focused === undefined ? active : focused || null;
+    setFocusId(current);
+    const i = rows.findIndex((r) => (r?.id ?? null) === current);
+    const row = rows[i];
+    let next: string | null | undefined;
+    if (e.key === "ArrowDown") next = i < rows.length - 1 ? (rows[i + 1]?.id ?? null) : undefined;
+    else if (e.key === "ArrowUp") next = i > 0 ? (rows[i - 1]?.id ?? null) : undefined;
+    else if (e.key === "Home") next = null;
+    else if (e.key === "End") next = rows[rows.length - 1]?.id ?? null;
+    else if (e.key === "ArrowRight") {
+      if (row?.children.length) {
+        if (expanded.has(row.id)) next = row.children[0].id;
+        else toggle(row.id);
+      }
+    } else if (e.key === "ArrowLeft") {
+      if (row && expanded.has(row.id)) toggle(row.id);
+      else if (row) next = row.parent_id && byId.has(row.parent_id) ? row.parent_id : null;
+    } else if (e.key === "Enter" || e.key === " ") {
+      if (!row) choose(null);
+      else if (!disabled.has(row.id)) choose(row.id);
+    } else return;
+    e.preventDefault();
+    if (next !== undefined) focusRow(next);
+  };
+
   return (
-    <div className="folder-picker" role="tree">
+    <div className="folder-picker" role="tree" aria-label="Folders" ref={treeRef} onKeyDown={onKeyDown}>
       <div
         className={`picker-row ${value === null ? "selected" : ""}`}
         role="treeitem"
+        aria-level={1}
         aria-selected={value === null}
-        onClick={() => onChange(null)}
+        tabIndex={active === null ? 0 : -1}
+        data-picker-id=""
+        onClick={() => choose(null)}
       >
         <Library size={18} />
         <span>Library</span>
@@ -123,32 +187,39 @@ export function FolderPicker({
           node={node}
           depth={1}
           value={value}
-          onChange={onChange}
+          onChange={choose}
           disabled={disabled}
           expanded={expanded}
           toggle={toggle}
+          active={active}
         />
       ))}
     </div>
   );
 }
 
-export function MoveDialog({
-  targets,
-  onClose,
-  onMove,
-  title = "Move to",
-  confirmLabel = "Move here",
-}: {
+interface MoveDialogProps {
   targets: LibraryNode[] | null;
   onClose: () => void;
   onMove: (folderId: string | null) => Promise<void>;
   title?: string;
   confirmLabel?: string;
-}) {
+}
+
+export function MoveDialog(props: MoveDialogProps) {
+  // Mounted per opening, so each one starts at the Library rather than the last (maybe hidden) choice.
+  return props.targets ? <MoveDialogBody {...props} targets={props.targets} /> : null;
+}
+
+function MoveDialogBody({
+  targets,
+  onClose,
+  onMove,
+  title = "Move to",
+  confirmLabel = "Move here",
+}: MoveDialogProps & { targets: LibraryNode[] }) {
   const [dest, setDest] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  if (!targets) return null;
   const excluded = targets.filter((t) => t.kind === "folder").map((t) => t.id);
   const label = targets.length === 1 ? `“${targets[0].name}”` : plural(targets.length, "item");
   return (
@@ -278,9 +349,10 @@ export function ChooseNotebookDialog({
   const [filter, setFilter] = useState("");
   if (!open) return null;
   const q = filter.trim().toLowerCase();
-  const shown = (notebooks ?? []).filter(
-    (n) => !q || n.name.toLowerCase().includes(q) || (n.location ?? "").toLowerCase().includes(q),
-  );
+  // Sort like the explorer; the API's byte-wise order would put "Ästhetik" after "Zoologie".
+  const shown = (notebooks ?? [])
+    .filter((n) => !q || n.name.toLowerCase().includes(q) || (n.location ?? "").toLowerCase().includes(q))
+    .sort((a, b) => compareNames(a.name, b.name) || compareNames(a.location ?? "", b.location ?? ""));
   return (
     <Modal
       open

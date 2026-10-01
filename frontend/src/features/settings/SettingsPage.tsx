@@ -2,10 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { NavLink, useNavigate, useParams } from "react-router";
 import { Archive, Download, Info, LogOut, Palette, UserRound } from "lucide-react";
-import { logout, updatePrefs } from "../../api/actions";
+import { logout, mergePrefs, updatePrefs } from "../../api/actions";
 import { api, downloadUrl, errorMessage } from "../../api/client";
 import { queryClient, useExports, useMe } from "../../api/queries";
-import type { ExportJob, Prefs, User } from "../../api/types";
+import type { ExportJob, Prefs, PrefsPatch, User } from "../../api/types";
 import { APP_BUILD } from "../../state/connection";
 import { formatBytes, formatDate } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
@@ -69,8 +69,8 @@ function AppearanceSettings() {
     if (me?.prefs) setPrefs(me.prefs);
   }, [me?.prefs]);
   if (!prefs) return null;
-  const set = (patch: Partial<Prefs>) => {
-    setPrefs({ ...prefs, ...patch });
+  const set = (patch: PrefsPatch) => {
+    setPrefs(mergePrefs(prefs, patch));
     updatePrefs(patch).catch(toastError);
   };
   return (
@@ -111,7 +111,7 @@ function AppearanceSettings() {
                 type="radio"
                 name="layout"
                 checked={prefs.reader.layout === layout}
-                onChange={() => void set({ reader: { ...prefs.reader, layout } })}
+                onChange={() => void set({ reader: { layout } })}
               />
               {label}
             </label>
@@ -121,7 +121,7 @@ function AppearanceSettings() {
           <input
             type="checkbox"
             checked={prefs.reader.cover_alone}
-            onChange={(e) => void set({ reader: { ...prefs.reader, cover_alone: e.target.checked } })}
+            onChange={(e) => void set({ reader: { cover_alone: e.target.checked } })}
           />
           <span>
             Show the first page on its own
@@ -199,8 +199,12 @@ function AccountSettings() {
           <button
             className="btn"
             onClick={async () => {
-              await logout();
-              navigate("/login", { replace: true });
+              try {
+                await logout();
+                navigate("/login", { replace: true });
+              } catch (err) {
+                toastError(err);
+              }
             }}
           >
             <LogOut /> Sign out
@@ -212,7 +216,8 @@ function AccountSettings() {
 }
 
 function jobStatus(job: ExportJob): string {
-  if (job.status === "done") return `Ready · ${formatBytes(job.size ?? 0)}`;
+  // A finished export may still list PDFs that could not be built.
+  if (job.status === "done") return `Ready · ${formatBytes(job.size ?? 0)}${job.error ? ` · ${job.error}` : ""}`;
   if (job.status === "failed") return job.error ?? "Failed";
   if (job.total) return `${job.progress} of ${job.total} PDFs`;
   return job.message || "Preparing…";
@@ -287,7 +292,14 @@ function ExportSettings() {
                   </small>
                 </div>
                 {job.status === "done" && (
-                  <button className="btn" onClick={() => downloadUrl(`/api/exports/${job.id}/download`)}>
+                  <button
+                    className="btn"
+                    onClick={() => {
+                      // The file name carries the export's date in the user's own time zone.
+                      const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+                      downloadUrl(`/api/exports/${job.id}/download?tz=${encodeURIComponent(tz)}`);
+                    }}
+                  >
                     <Download /> Download
                   </button>
                 )}

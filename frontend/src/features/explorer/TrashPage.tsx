@@ -2,11 +2,13 @@ import { ContextMenu } from "radix-ui";
 import { useMemo, useState } from "react";
 import { ArchiveRestore, Trash2, X } from "lucide-react";
 import { emptyTrash, purgeNodes, restoreNodes } from "../../api/actions";
+import { errorMessage } from "../../api/client";
 import { useTrash } from "../../api/queries";
 import type { LibraryNode } from "../../api/types";
 import { ContextMenuContent, type MenuEntry } from "../../components/Menu";
 import { plural } from "../../lib/format";
-import { useDocumentTitle, useIsCoarse } from "../../lib/hooks";
+import { useDocumentTitle, useIsCoarse, useLongPressMenu } from "../../lib/hooks";
+import { shortcutKey } from "../../lib/keys";
 import { confirmDialog } from "../../state/dialogs";
 import { toast, toastError } from "../../state/toasts";
 import { ListView } from "./ItemViews";
@@ -15,7 +17,7 @@ import { useSelection } from "./useSelection";
 
 export function TrashPage() {
   useDocumentTitle("Trash");
-  const { data, isLoading } = useTrash();
+  const { data, isLoading, error, refetch } = useTrash();
   const coarse = useIsCoarse();
   const items = useMemo(() => data ?? [], [data]);
   const ids = useMemo(() => items.map((i) => i.id), [items]);
@@ -67,6 +69,20 @@ export function TrashPage() {
     }
   };
 
+  /** Sets the right-click menu's targets for a click on `target`; false where no menu applies. */
+  const targetMenuAt = (target: HTMLElement): boolean => {
+    const el = target.closest<HTMLElement>("[data-node-id]");
+    if (!el) {
+      setMenuTargets([]);
+      return false;
+    }
+    const id = el.dataset.nodeId!;
+    if (!selection.selected.has(id)) selection.selectOnly(id);
+    setMenuTargets(selection.selected.has(id) ? selected : items.filter((i) => i.id === id));
+    return true;
+  };
+  const longPress = useLongPressMenu(targetMenuAt);
+
   const entries = (targets: LibraryNode[]): MenuEntry[] => [
     { label: "Restore", icon: <ArchiveRestore />, onSelect: () => void restore(targets) },
     { type: "sep" },
@@ -99,33 +115,40 @@ export function TrashPage() {
           </button>
         </div>
       </div>
-      <ContextMenu.Root>
+      <ContextMenu.Root onOpenChange={longPress.onOpenChange}>
         <ContextMenu.Trigger asChild>
           <div
             className="explorer-content"
             tabIndex={0}
+            onPointerDownCapture={longPress.onPointerDownCapture}
+            onContextMenuCapture={longPress.onContextMenuCapture}
             onContextMenu={(e) => {
-              const el = (e.target as HTMLElement).closest<HTMLElement>("[data-node-id]");
-              if (!el) {
-                e.preventDefault();
-                return;
-              }
-              const id = el.dataset.nodeId!;
-              if (!selection.selected.has(id)) selection.selectOnly(id);
-              setMenuTargets(selection.selected.has(id) ? selected : items.filter((i) => i.id === id));
+              if (!targetMenuAt(e.target as HTMLElement)) e.preventDefault();
             }}
             onKeyDown={(e) => {
-              if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+              // Keys already handled by a control in the list (the "…" button), or typed in its portalled menu.
+              if (e.defaultPrevented || !e.currentTarget.contains(e.target as Node)) return;
+              if ((e.ctrlKey || e.metaKey) && shortcutKey(e) === "a") {
                 e.preventDefault();
                 selection.selectAll();
               }
-              if (e.key === "Delete" && selected.length) void purge(selected);
+              if (e.key === "Delete" && selected.length && !e.repeat) void purge(selected);
               if (e.key === "Escape") selection.clear();
             }}
           >
             {isLoading ? (
               <div className="center-fill">
                 <div className="spinner lg" />
+              </div>
+            ) : error && !data ? (
+              <div className="center-fill">
+                <div className="empty">
+                  <h3>Couldn't load the Trash</h3>
+                  <p>{errorMessage(error)}</p>
+                  <button className="btn" onClick={() => void refetch()}>
+                    Try again
+                  </button>
+                </div>
               </div>
             ) : items.length === 0 ? (
               <div className="center-fill">

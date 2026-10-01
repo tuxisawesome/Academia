@@ -10,6 +10,21 @@ body,
   height: 100%;
 }
 
+/* viewport-fit=cover draws under the notch and rounded corners in landscape; keep the app clear of them. */
+#root {
+  padding-left: env(safe-area-inset-left);
+  padding-right: env(safe-area-inset-right);
+}
+
+/* iOS zooms into any text field under 16px on focus (and stays zoomed), so touch screens get 16px fields. */
+@media (pointer: coarse) {
+  input:not([type="checkbox"], [type="radio"], [type="range"], [type="color"], [type="file"]),
+  textarea,
+  select {
+    font-size: 16px !important;
+  }
+}
+
 html {
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;

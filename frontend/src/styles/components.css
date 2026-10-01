@@ -296,6 +296,10 @@
 .menu {
   min-width: 210px;
   max-width: 320px;
+  /* Radix positions menus but never limits their height: keep long ones on screen and scrollable. */
+  max-height: var(--radix-dropdown-menu-content-available-height, var(--radix-context-menu-content-available-height, none));
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 5px;
   border-radius: 10px;
   background: var(--bg-raised);
@@ -472,10 +476,12 @@
 .dialog-title {
   font-size: 23px;
   flex: 1;
+  overflow-wrap: anywhere;
 }
 
 .dialog-description {
   color: var(--ink-muted);
+  overflow-wrap: anywhere;
   margin: 4px 0 0;
   font-size: 14.5px;
 }
@@ -531,6 +537,8 @@
 
 .toast .toast-msg {
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .toast button {
@@ -725,6 +733,7 @@ kbd {
   position: fixed;
   inset: 0;
   z-index: 200;
+  pointer-events: auto; /* an open Radix dialog or menu sets pointer-events: none on <body> */
   display: grid;
   place-items: center;
   padding: 24px;
@@ -760,9 +769,10 @@ kbd {
 
 .update-banner {
   position: fixed;
-  right: 16px;
+  right: max(16px, env(safe-area-inset-right));
   bottom: max(16px, env(safe-area-inset-bottom));
   z-index: 95;
+  pointer-events: auto;
   display: flex;
   align-items: center;
   gap: 12px;

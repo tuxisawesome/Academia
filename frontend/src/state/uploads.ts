@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import { api, errorMessage } from "../api/client";
 import { createNotebook } from "../api/actions";
-import { invalidateLibrary, queryClient } from "../api/queries";
+import { invalidateLibrary, onSessionEnd, queryClient } from "../api/queries";
 import { baseName, isPdfFile, uploadPdf } from "../api/upload";
 import type { NotebookDetail } from "../api/types";
 import { toast } from "./toasts";
@@ -28,6 +28,12 @@ export const useUploads = create<UploadState>((set) => ({
   update: (id, patch) => set((s) => ({ items: s.items.map((i) => (i.id === id ? { ...i, ...patch } : i)) })),
   clearFinished: () => set((s) => ({ items: s.items.filter((i) => i.status === "uploading" || i.status === "processing") })),
 }));
+
+// The tray lists the signed-in user's files: stop their uploads and forget them when the session ends.
+onSessionEnd(() => {
+  for (const item of useUploads.getState().items) item.abort?.();
+  useUploads.setState({ items: [] });
+});
 
 let nextId = 1;
 

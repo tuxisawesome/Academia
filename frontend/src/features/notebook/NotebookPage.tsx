@@ -2,6 +2,7 @@ import { ContextMenu } from "radix-ui";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router";
 import {
+  ArchiveRestore,
   BookOpen,
   BookmarkPlus,
   Bookmark as BookmarkIcon,
@@ -33,24 +34,27 @@ import {
   undeletePages,
   restoreNodes,
 } from "../../api/actions";
-import { ApiError } from "../../api/client";
-import { useNotebook } from "../../api/queries";
+import { ApiError, errorMessage, isNotFound, isPageError } from "../../api/client";
+import { invalidateLibrary, queryClient, useNotebook } from "../../api/queries";
 import type { NotebookDetail } from "../../api/types";
 import { ContextMenuContent, MenuButton, type MenuEntry } from "../../components/Menu";
 import { bookmarkColor } from "../../lib/colors";
 import { plural } from "../../lib/format";
-import { isEditableTarget, useDocumentTitle, useIsNarrow } from "../../lib/hooks";
+import { useDocumentTitle, useIsNarrow } from "../../lib/hooks";
+import { shortcutKey } from "../../lib/keys";
 import { rangesLabel, toRanges } from "../../lib/ranges";
 import { promptDialog } from "../../state/dialogs";
 import { toast, toastError } from "../../state/toasts";
 import { MoveDialog } from "../explorer/dialogs";
 import { Breadcrumbs } from "../explorer/ExplorerPage";
+import { confirmTrash } from "../explorer/nodeActions";
 import { PageGrid, useGridZoom, ZOOM_STEPS, type PageGridHandle } from "./PageGrid";
 import { PagePreview } from "./PagePreview";
+import { isPageShortcut } from "./shortcuts";
 
 export function NotebookPage() {
   const { id } = useParams();
-  const { data: nb, isLoading, error } = useNotebook(id);
+  const { data: nb, isLoading, error, refetch } = useNotebook(id);
   const navigate = useNavigate();
   const narrow = useIsNarrow();
   const gridRef = useRef<PageGridHandle>(null);
@@ -60,6 +64,8 @@ export function NotebookPage() {
   const [hoverBookmark, setHoverBookmark] = useState<string | null>(null);
   const [preview, setPreview] = useState<number | null>(null);
   const [moving, setMoving] = useState(false);
+  // Page under the last touch/pen press: Radix opens long-press menus by timer, without a contextmenu event on iOS.
+  const pressedPage = useRef<string | null>(null);
   useDocumentTitle(nb?.name);
 
   const pages = useMemo(() => nb?.pages ?? [], [nb?.pages]);
@@ -92,14 +98,24 @@ export function NotebookPage() {
     return bm ? new Set(bm.page_ids) : null;
   }, [hoverBookmark, nb?.bookmarks]);
 
-  if (error) {
+  if (isPageError(error, !!nb)) {
     return (
       <div className="center-fill">
-        <div className="empty">
-          <h3>{error instanceof ApiError && error.status === 404 ? "Notebook not found" : "Couldn't load notebook"}</h3>
-          <p>It may have been moved to the Trash.</p>
-          <Link to="/">Go to your library</Link>
-        </div>
+        {isNotFound(error) ? (
+          <div className="empty">
+            <h3>Notebook not found</h3>
+            <p>It may have been moved to the Trash.</p>
+            <Link to="/">Go to your library</Link>
+          </div>
+        ) : (
+          <div className="empty">
+            <h3>Couldn't load notebook</h3>
+            <p>{errorMessage(error)}</p>
+            <button className="btn" onClick={() => void refetch()}>
+              Try again
+            </button>
+          </div>
+        )}
       </div>
     );
   }
@@ -110,6 +126,10 @@ export function NotebookPage() {
       </div>
     );
   }
+
+  // A notebook in the Trash can still be opened (Back, another tab), but the server rejects every change.
+  const trashed = Boolean(nb.trashed_at);
+  const canAct = !trashed && ordered.length > 0;
 
   const run = async (fn: () => Promise<unknown>) => {
     try {
@@ -162,6 +182,28 @@ export function NotebookPage() {
     });
 
   const readFrom = (index: number) => navigate(`/read/n/${nb.id}?page=${index + 1}`);
+
+  const selectForMenu = (pid: string | null) => {
+    if (pid && !selected.has(pid)) setSelected(new Set([pid]));
+  };
+
+  const restore = async () => {
+    try {
+      await restoreNodes([nb.id]);
+      toast(`Restored “${nb.name}”.`);
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 404) {
+        // Already restored (or purged) elsewhere: the refetch shows that. Otherwise only a trash root can be
+        // restored, and a notebook trashed along with its folder comes back with the folder.
+        await invalidateLibrary();
+        const state = queryClient.getQueryState<NotebookDetail>(["notebook", nb.id]);
+        if (state?.status === "error" || !state?.data?.trashed_at) return;
+        toast(`“${nb.name}” was moved to the Trash with its folder. Restore the folder from the Trash.`, {
+          action: { label: "Open Trash", onClick: () => navigate("/trash") },
+        });
+      } else toastError(err);
+    }
+  };
 
   const moveToPosition = async () => {
     if (!ordered.length) return;
@@ -237,6 +279,7 @@ export function NotebookPage() {
       danger: true,
       onSelect: () =>
         void run(async () => {
+          if (!(await confirmTrash([nb]))) return;
           await trashNodes([nb.id]);
           toast(`“${nb.name}” moved to Trash.`, {
             action: { label: "Undo", onClick: () => void restoreNodes([nb.id]).catch(toastError) },
@@ -247,23 +290,23 @@ export function NotebookPage() {
   ];
 
   function onKeyDown(e: React.KeyboardEvent) {
-    if (isEditableTarget(e.target)) return;
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "a") {
+    if (!isPageShortcut(e)) return;
+    if ((e.ctrlKey || e.metaKey) && shortcutKey(e) === "a") {
       e.preventDefault();
       setSelected(new Set(pages.map((p) => p.id)));
     } else if (e.key === "Escape") setSelected(new Set());
-    else if ((e.key === "Delete" || e.key === "Backspace") && ordered.length) {
+    else if ((e.key === "Delete" || e.key === "Backspace") && canAct) {
       e.preventDefault();
       void remove();
-    } else if (e.key === "]" && ordered.length) void rotate(90);
-    else if (e.key === "[" && ordered.length) void rotate(-90);
-    else if (e.key === "Enter" && ordered.length) readFrom(indexOf.get(ordered[0]) ?? 0);
+    } else if (e.key === "]" && canAct) void rotate(90);
+    else if (e.key === "[" && canAct) void rotate(-90);
+    else if (e.key === "Enter" && canAct) readFrom(indexOf.get(ordered[0]) ?? 0);
   }
 
   return (
     <div className="notebook-page" onKeyDown={onKeyDown}>
       <header className="nb-header">
-        <Breadcrumbs path={nb.path.slice(0, -1)} />
+        <Breadcrumbs path={nb.path.slice(0, -1)} linkLast />
         <div className="nb-title-row">
           <div className="nb-title">
             <h1 className="truncate">{nb.name}</h1>
@@ -274,24 +317,32 @@ export function NotebookPage() {
             </span>
           </div>
           <div className="nb-actions">
-            <button className="btn btn-primary" disabled={!pages.length} onClick={() => navigate(`/read/n/${nb.id}`)}>
-              <BookOpen /> Read
-            </button>
-            <button className="btn" onClick={() => navigate(`/n/${nb.id}/upload`)}>
-              <FilePlus2 /> {!narrow && "Add PDF"}
-            </button>
-            <button className="btn" disabled={!pages.length} onClick={() => downloadNode(nb)} title="Download PDF with bookmarks">
-              <Download /> {!narrow && "Download"}
-            </button>
-            <MenuButton entries={notebookEntries} label="Notebook actions">
-              <MoreHorizontal />
-            </MenuButton>
+            {trashed ? (
+              <button className="btn btn-primary" onClick={() => void restore()}>
+                <ArchiveRestore /> Restore
+              </button>
+            ) : (
+              <>
+                <button className="btn btn-primary" disabled={!pages.length} onClick={() => navigate(`/read/n/${nb.id}`)}>
+                  <BookOpen /> Read
+                </button>
+                <button className="btn" onClick={() => navigate(`/n/${nb.id}/upload`)}>
+                  <FilePlus2 /> {!narrow && "Add PDF"}
+                </button>
+                <button className="btn" disabled={!pages.length} onClick={() => downloadNode(nb)} title="Download PDF with bookmarks">
+                  <Download /> {!narrow && "Download"}
+                </button>
+                <MenuButton entries={notebookEntries} label="Notebook actions">
+                  <MoreHorizontal />
+                </MenuButton>
+              </>
+            )}
           </div>
         </div>
       </header>
 
       <div className="nb-toolbar">
-        {ordered.length > 0 ? (
+        {canAct ? (
           <>
             <span className="sel-count tabular">
               {plural(ordered.length, "page")} selected <span className="faint">({selectionLabel})</span>
@@ -317,11 +368,13 @@ export function NotebookPage() {
           </>
         ) : (
           <span className="faint hint">
-            {pages.length
-              ? narrow
-                ? "Tap pages to select them."
-                : "Click to select pages · drag to reorder · right-click for more"
-              : ""}
+            {trashed
+              ? "This notebook is in the Trash. Restore it to read or change it."
+              : pages.length
+                ? narrow
+                  ? "Tap pages to select them."
+                  : "Click to select pages · drag to reorder · right-click for more"
+                : ""}
           </span>
         )}
         <div className="nb-toolbar-right">
@@ -353,16 +406,32 @@ export function NotebookPage() {
           <div className="center-fill">
             <div className="empty">
               <h3>No pages yet</h3>
-              <p>Add a PDF to start this notebook.</p>
-              <button className="btn btn-primary" onClick={() => navigate(`/n/${nb.id}/upload`)}>
-                <FilePlus2 /> Add PDF
-              </button>
+              {!trashed && (
+                <>
+                  <p>Add a PDF to start this notebook.</p>
+                  <button className="btn btn-primary" onClick={() => navigate(`/n/${nb.id}/upload`)}>
+                    <FilePlus2 /> Add PDF
+                  </button>
+                </>
+              )}
             </div>
           </div>
         ) : (
-          <ContextMenu.Root>
-            <ContextMenu.Trigger asChild>
-              <div className="nb-grid-wrap">
+          <ContextMenu.Root
+            onOpenChange={(open) => {
+              if (!open) return;
+              selectForMenu(pressedPage.current);
+              pressedPage.current = null;
+            }}
+          >
+            <ContextMenu.Trigger asChild disabled={trashed}>
+              <div
+                className="nb-grid-wrap"
+                onPointerDown={(e) => {
+                  const tile = (e.target as HTMLElement).closest<HTMLElement>("[data-page-index]");
+                  pressedPage.current = e.pointerType !== "mouse" && tile ? pages[Number(tile.dataset.pageIndex)].id : null;
+                }}
+              >
                 <PageGrid
                   ref={gridRef}
                   pages={pages}
@@ -372,12 +441,10 @@ export function NotebookPage() {
                   tileWidth={ZOOM_STEPS[zoom]}
                   markers={markers}
                   highlight={highlight}
-                  onReorder={(order) => void run(() => reorderPages(nb, order))}
-                  onOpen={readFrom}
+                  onReorder={trashed ? undefined : (order) => void run(() => reorderPages(nb, order))}
+                  onOpen={trashed ? undefined : readFrom}
                   onPreview={setPreview}
-                  onPageContextMenu={(pid) => {
-                    if (pid && !selected.has(pid)) setSelected(new Set([pid]));
-                  }}
+                  onPageContextMenu={selectForMenu}
                   ariaLabel={`Pages of ${nb.name}`}
                 />
               </div>
@@ -430,6 +497,9 @@ function BookmarksPanel({
   onClose: () => void;
 }) {
   const navigate = useNavigate();
+  // A bookmark of a notebook in the Trash can't be read, edited or downloaded until it is restored.
+  const inTrash = Boolean(nb.trashed_at);
+  const inTrashTitle = (title: string) => (inTrash ? "Restore the notebook first" : title);
   return (
     <aside className="nb-panel" aria-label="Bookmarks in this notebook">
       <header>
@@ -457,8 +527,8 @@ function BookmarksPanel({
                 <button
                   className="icon-btn icon-btn-sm"
                   aria-label={`Read ${bm.name}`}
-                  title="Read"
-                  disabled={!bm.page_ids.length}
+                  title={inTrashTitle("Read")}
+                  disabled={inTrash || !bm.page_ids.length}
                   onClick={() => navigate(`/read/b/${bm.id}`)}
                 >
                   <BookOpen />
@@ -466,7 +536,8 @@ function BookmarksPanel({
                 <button
                   className="icon-btn icon-btn-sm"
                   aria-label={`Edit ${bm.name}`}
-                  title="Edit pages"
+                  title={inTrashTitle("Edit pages")}
+                  disabled={inTrash}
                   onClick={() => navigate(`/b/${bm.id}/edit`)}
                 >
                   <Pencil />
@@ -474,8 +545,8 @@ function BookmarksPanel({
                 <button
                   className="icon-btn icon-btn-sm"
                   aria-label={`Download ${bm.name}`}
-                  title="Download PDF"
-                  disabled={!bm.page_ids.length}
+                  title={inTrashTitle("Download PDF")}
+                  disabled={inTrash || !bm.page_ids.length}
                   onClick={() => downloadNode({ id: bm.id, kind: "bookmark" })}
                 >
                   <Download />

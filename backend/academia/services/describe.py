@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ..models import BOOKMARK, FOLDER, NOTEBOOK, Bookmark, BookmarkPage, Node, Notebook, Page, SourcePage
-from .common import chunks, live_children_count, segments, segments_label
+from .common import chunks, live_children_count, segments, segments_label, trashed_children_count
 
 
 def page_json(page: Page, sp: SourcePage | None) -> dict[str, Any]:
@@ -70,11 +70,15 @@ def bookmark_members(db: Session, bookmark_ids: Sequence[str]) -> dict[str, list
 
 
 def describe_nodes(db: Session, nodes: Sequence[Node]) -> list[dict[str, Any]]:
-    folder_ids = [n.id for n in nodes if n.kind == FOLDER]
+    folder_ids = [n.id for n in nodes if n.kind == FOLDER and n.trashed_at is None]
+    trashed_folder_ids = [n.id for n in nodes if n.kind == FOLDER and n.trashed_at is not None]
     nb_ids = [n.id for n in nodes if n.kind == NOTEBOOK]
     bm_ids = [n.id for n in nodes if n.kind == BOOKMARK]
 
     child_counts = live_children_count(db, folder_ids) if folder_ids else {}
+    # A trashed folder has no live children; count the ones that come back when it is restored.
+    if trashed_folder_ids:
+        child_counts.update(trashed_children_count(db, trashed_folder_ids))
 
     notebooks: dict[str, Notebook] = {}
     covers: dict[str, dict[str, Any]] = {}

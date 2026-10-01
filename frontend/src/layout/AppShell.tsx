@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, NavLink, Outlet, useLocation, useMatch, useNavigate, useSearchParams } from "react-router";
 import { LogOut, Menu as MenuIcon, Monitor, Moon, Search, Settings, Sun, Trash2, Users, X } from "lucide-react";
 import { logout, updatePrefs } from "../api/actions";
@@ -7,6 +7,7 @@ import type { Prefs } from "../api/types";
 import { Wordmark } from "../components/Glyphs";
 import { MenuButton, type MenuEntry } from "../components/Menu";
 import { useIsNarrow } from "../lib/hooks";
+import { isImeKey } from "../lib/keys";
 import { toastError } from "../state/toasts";
 import { FolderTree } from "./FolderTree";
 import { PinnedFolders } from "./PinnedFolders";
@@ -29,22 +30,44 @@ function SearchBox() {
   const [params] = useSearchParams();
   const scope = useSearchScope();
   const onSearchPage = location.pathname === "/search";
-  const [value, setValue] = useState(onSearchPage ? (params.get("q") ?? "") : "");
+  const urlQuery = onSearchPage ? (params.get("q") ?? "") : "";
+  const [value, setValue] = useState(urlQuery);
+  // The query the box last navigated to (or showed), to tell its own navigations from Back/Forward.
+  const sent = useRef(urlQuery);
+  const timer = useRef<ReturnType<typeof setTimeout>>(undefined);
 
   useEffect(() => {
-    if (!onSearchPage) setValue("");
-  }, [onSearchPage]);
+    if (!onSearchPage) {
+      sent.current = "";
+      setValue("");
+    } else if (urlQuery !== sent.current) {
+      sent.current = urlQuery;
+      setValue(urlQuery);
+    }
+  }, [onSearchPage, urlQuery]);
+
+  // Read when the typing pause ends: the box's own navigation to /search may still be rendering
+  // when the timer was set, and that search must then replace, not push, the results page.
+  const onSearchPageNow = useRef(onSearchPage);
+  useEffect(() => {
+    onSearchPageNow.current = onSearchPage;
+    // A search still waiting for the typing pause must not fire after the user went to another page.
+    if (!onSearchPage) clearTimeout(timer.current);
+  }, [onSearchPage, location.pathname]);
 
   const go = (q: string, replace: boolean) => {
+    clearTimeout(timer.current);
+    sent.current = q;
     const query = new URLSearchParams({ q });
     if (scope) query.set("in", scope.id);
     navigate(`/search?${query}`, { replace });
   };
 
   useEffect(() => {
-    if (!value.trim()) return;
-    const t = setTimeout(() => go(value.trim(), onSearchPage), 300);
-    return () => clearTimeout(t);
+    const q = value.trim();
+    if (!q || q === sent.current) return;
+    timer.current = setTimeout(() => go(q, onSearchPageNow.current), 300);
+    return () => clearTimeout(timer.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [value]);
 
@@ -63,10 +86,11 @@ function SearchBox() {
         type="search"
         placeholder={label}
         aria-label={label}
+        maxLength={200}
         value={value}
         onChange={(e) => setValue(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") {
+          if (e.key === "Escape" && !isImeKey(e.nativeEvent)) {
             setValue("");
             (e.target as HTMLInputElement).blur();
           }
@@ -84,8 +108,28 @@ export function AppShell() {
   const location = useLocation();
   const narrow = useIsNarrow();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const openButton = useRef<HTMLButtonElement>(null);
+  const closeButton = useRef<HTMLButtonElement>(null);
+  const sidebar = useRef<HTMLElement>(null);
 
   useEffect(() => setDrawerOpen(false), [location.pathname]);
+
+  const closeDrawer = useCallback(() => {
+    // Give focus back to the hamburger before the drawer becomes inert and drops it.
+    if (sidebar.current?.contains(document.activeElement)) openButton.current?.focus();
+    setDrawerOpen(false);
+  }, []);
+
+  // The open drawer takes focus and closes on Escape (unless a menu or dialog in it handled Escape).
+  useEffect(() => {
+    if (!narrow || !drawerOpen) return;
+    closeButton.current?.focus();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !e.defaultPrevented) closeDrawer();
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, [narrow, drawerOpen, closeDrawer]);
 
   if (!me) return null;
   const theme = me.prefs.theme;
@@ -107,8 +151,12 @@ export function AppShell() {
       label: "Sign out",
       icon: <LogOut />,
       onSelect: async () => {
-        await logout();
-        navigate("/login", { replace: true });
+        try {
+          await logout();
+          navigate("/login", { replace: true });
+        } catch (err) {
+          toastError(err);
+        }
       },
     },
   ];
@@ -124,7 +172,7 @@ export function AppShell() {
     <div className={`shell ${drawerOpen ? "drawer-open" : ""}`}>
       <header className="topbar">
         {narrow && (
-          <button className="icon-btn" aria-label="Open navigation" onClick={() => setDrawerOpen(true)}>
+          <button ref={openButton} className="icon-btn" aria-label="Open navigation" onClick={() => setDrawerOpen(true)}>
             <MenuIcon />
           </button>
         )}
@@ -144,11 +192,12 @@ export function AppShell() {
         </div>
       </header>
 
-      <aside className="app-sidebar" aria-label="Library navigation">
+      {/* Off-screen while the narrow layout's drawer is closed: keep it out of the Tab order too. */}
+      <aside ref={sidebar} className="app-sidebar" aria-label="Library navigation" inert={narrow && !drawerOpen}>
         {narrow && (
           <div className="drawer-head">
             <Wordmark />
-            <button className="icon-btn" aria-label="Close navigation" onClick={() => setDrawerOpen(false)}>
+            <button ref={closeButton} className="icon-btn" aria-label="Close navigation" onClick={closeDrawer}>
               <X />
             </button>
           </div>
@@ -171,7 +220,7 @@ export function AppShell() {
           )}
         </div>
       </aside>
-      {narrow && drawerOpen && <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} />}
+      {narrow && drawerOpen && <div className="drawer-scrim" onClick={closeDrawer} />}
 
       <main className="main" id="main">
         <Outlet />

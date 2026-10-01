@@ -5,7 +5,9 @@
  * navigation fails (no connection), the offline page is shown instead. This keeps the app
  * installable without ever serving stale code or data.
  */
-const CACHE = "academia-offline-v1";
+// Bumping the version re-runs "activate", which deletes every other cache on this origin
+// (v2: the multi-gigabyte model files the removed handwriting recognition left in Cache Storage).
+const CACHE = "academia-offline-v2";
 const OFFLINE_URL = "/offline.html";
 
 self.addEventListener("install", (event) => {

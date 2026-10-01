@@ -1,7 +1,15 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { Tooltip } from "radix-ui";
 import { lazy, Suspense, useEffect, type ReactNode } from "react";
-import { createBrowserRouter, Navigate, RouterProvider, useLocation } from "react-router";
+import {
+  createBrowserRouter,
+  Navigate,
+  RouterProvider,
+  useLocation,
+  useRouteError,
+  type RouteObject,
+} from "react-router";
+import { errorMessage } from "./api/client";
 import { queryClient, useMe } from "./api/queries";
 import { ConnectionGuard, UpdateBanner } from "./components/ConnectionGuard";
 import { DialogHost } from "./components/DialogHost";
@@ -18,6 +26,7 @@ import { NotebookPage } from "./features/notebook/NotebookPage";
 import { UploadPage } from "./features/notebook/UploadPage";
 import { SettingsPage } from "./features/settings/SettingsPage";
 import { AppShell } from "./layout/AppShell";
+import { isChunkLoadError } from "./lib/staleBuild";
 import { applyTheme } from "./lib/theme";
 
 const ReaderPage = lazy(() => import("./features/reader/ReaderPage"));
@@ -31,10 +40,24 @@ function Splash() {
 }
 
 function RequireAuth({ children, allowPasswordChange = false }: { children: ReactNode; allowPasswordChange?: boolean }) {
-  const { data: me, isLoading, isError } = useMe();
+  const { data: me, isLoading, isError, isFetching, error, refetch } = useMe();
   const location = useLocation();
   if (isLoading) return <Splash />;
-  if (isError && me === undefined) return <Splash />;
+  // Network failures and restarts also get ConnectionGuard's overlay, which retries and refetches
+  // ["me"]; any other failure (a 500, say) needs its own way out of the splash screen.
+  if (isError && me === undefined) {
+    return (
+      <div className="center-fill">
+        <div className="empty">
+          <h3>Academia couldn't start</h3>
+          <p>{errorMessage(error)}</p>
+          <button className="btn btn-primary" disabled={isFetching} onClick={() => void refetch()}>
+            {isFetching ? "Trying again…" : "Try again"}
+          </button>
+        </div>
+      </div>
+    );
+  }
   if (!me) {
     const next = location.pathname + location.search;
     return <Navigate to={`/login${next && next !== "/" ? `?next=${encodeURIComponent(next)}` : ""}`} replace />;
@@ -64,7 +87,24 @@ function NotFound() {
   );
 }
 
-const router = createBrowserRouter([
+/** Shown instead of a page that failed to render, e.g. the reader's code after an update. */
+function RouteError() {
+  const updated = isChunkLoadError(useRouteError());
+  return (
+    <div className="center-fill">
+      <div className="empty">
+        <h3>{updated ? "Academia has been updated" : "Something went wrong"}</h3>
+        <p>{updated ? "Reload to start using the new version." : "This page couldn't be shown. Reloading usually helps."}</p>
+        <button className="btn btn-primary" onClick={() => window.location.reload()}>
+          Reload
+        </button>
+        {!updated && <a href="/">Go to your library</a>}
+      </div>
+    </div>
+  );
+}
+
+const routes: RouteObject[] = [
   { path: "/login", element: <LoginPage /> },
   {
     path: "/change-password",
@@ -104,7 +144,9 @@ const router = createBrowserRouter([
       { path: "*", element: <NotFound /> },
     ],
   },
-]);
+];
+
+const router = createBrowserRouter([{ errorElement: <RouteError />, children: routes }]);
 
 export function App() {
   return (

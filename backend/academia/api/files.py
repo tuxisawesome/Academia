@@ -5,8 +5,9 @@ from __future__ import annotations
 import hashlib
 from typing import Any
 
+import anyio
+import anyio.to_thread
 from fastapi import APIRouter, Query, Request
-from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -24,6 +25,16 @@ from ..storage import tmp_dir
 from .deps import CurrentUser, Db
 
 router = APIRouter(tags=["files"])
+
+
+def _ingest_limiter(request: Request) -> anyio.CapacityLimiter:
+    # Uploads wait for one of the few PDF workers. They queue here instead of in the
+    # shared thread pool, so a burst of uploads cannot starve every other request.
+    state = request.app.state
+    limiter = getattr(state, "ingest_limiter", None)
+    if limiter is None:
+        limiter = state.ingest_limiter = anyio.CapacityLimiter(max(1, get_settings().pdf_workers))
+    return limiter
 
 
 @router.post("/sources")
@@ -56,7 +67,9 @@ async def upload_source(
             raise BadRequest("The uploaded file is empty.", code="empty_upload")
         if b"%PDF" not in head:
             raise BadRequest("That file is not a PDF.", code="not_pdf")
-        return await run_in_threadpool(store_upload, user.id, tmp, digest.hexdigest(), size, filename)
+        return await anyio.to_thread.run_sync(
+            store_upload, user.id, tmp, digest.hexdigest(), size, filename, limiter=_ingest_limiter(request)
+        )
     except ClientDisconnect:
         raise BadRequest("The upload was interrupted.", code="upload_interrupted") from None
     finally:
@@ -126,8 +139,10 @@ def export_status(job_id: str, user: CurrentUser) -> dict[str, Any]:
 
 
 @router.get("/exports/{job_id}/download")
-def export_download(job_id: str, user: CurrentUser) -> FileResponse:
-    path, filename = export_service.export_file(user.id, job_id)
+def export_download(
+    job_id: str, user: CurrentUser, tz: str | None = Query(default=None, max_length=64)
+) -> FileResponse:
+    path, filename = export_service.export_file(user.id, job_id, tz)
     return FileResponse(
         path, media_type="application/zip", filename=filename, headers={"Cache-Control": "private, no-store"}
     )

@@ -1,5 +1,5 @@
-import { QueryCache, QueryClient, useQuery } from "@tanstack/react-query";
-import { api, ApiError } from "./client";
+import { QueryCache, QueryClient, useQuery, type Query } from "@tanstack/react-query";
+import { api, ApiError, setSessionEndedHandler } from "./client";
 import type {
   AdminUser,
   BookmarkDetail,
@@ -17,9 +17,9 @@ import type {
 export const queryClient = new QueryClient({
   queryCache: new QueryCache({
     onError: (error) => {
-      if (error instanceof ApiError) {
-        if (error.status === 401) queryClient.setQueryData(["me"], null);
-        if (error.code === "password_change_required") void queryClient.invalidateQueries({ queryKey: ["me"] });
+      // A 401 is handled for every request in api() (see setSessionEndedHandler below).
+      if (error instanceof ApiError && error.code === "password_change_required") {
+        void queryClient.invalidateQueries({ queryKey: ["me"] });
       }
     },
   }),
@@ -33,6 +33,44 @@ export const queryClient = new QueryClient({
       },
     },
   },
+});
+
+// Any request that finds the session gone signs the tab out (RequireAuth then shows the sign-in page).
+setSessionEndedHandler(() => queryClient.setQueryData(["me"], null));
+
+const sessionEndListeners = new Set<() => void>();
+
+/** Runs `listener` whenever the signed-in user's session ends in this tab (see below). */
+export function onSessionEnd(listener: () => void): void {
+  sessionEndListeners.add(listener);
+}
+
+let signedInAs: string | null = null;
+let lastEndedSession: string | null = null;
+
+/** The id of the user whose session most recently ended in this tab, if any. */
+export function endedSessionUser(): string | null {
+  return lastEndedSession;
+}
+
+// Everything cached belongs to the signed-in user. When ["me"] changes to nobody (sign-out, or a
+// session the server ended) or to someone else, drop it all so the next user never sees it. The
+// ["me"] query itself is kept: long-lived observers such as ThemeSync stay attached to it.
+queryClient.getQueryCache().subscribe((event) => {
+  if (event.type !== "updated" || event.action.type !== "success" || event.query.queryKey[0] !== "me") return;
+  const id = (event.query.state.data as User | null | undefined)?.id ?? null;
+  if (id === signedInAs) return;
+  const previous = signedInAs;
+  signedInAs = id;
+  if (previous === null) return;
+  lastEndedSession = previous;
+  const others = { predicate: (query: Query) => query.queryKey[0] !== "me" };
+  // Signed out: the signed-in pages unmount, so their queries can go. Another user signed in
+  // elsewhere: reset the queries still on screen, which refetches them.
+  if (id === null) queryClient.removeQueries(others);
+  else void queryClient.resetQueries(others);
+  queryClient.getMutationCache().clear();
+  for (const listener of sessionEndListeners) listener();
 });
 
 export const LIBRARY_KEYS = ["nodes", "tree", "trash", "search", "notebooks", "node", "bookmark", "notebook", "pins"];
@@ -78,19 +116,26 @@ export function useNode(id: string | null | undefined) {
   });
 }
 
-export function useNotebook(id: string | null | undefined) {
+/** `staleTime: 0` makes a page refetch the data whenever it opens, even if a cached copy is recent. */
+interface DetailOptions {
+  staleTime?: number;
+}
+
+export function useNotebook(id: string | null | undefined, options: DetailOptions = {}) {
   return useQuery({
     queryKey: ["notebook", id],
     queryFn: () => api<NotebookDetail>(`/notebooks/${id}`),
     enabled: !!id,
+    ...options,
   });
 }
 
-export function useBookmark(id: string | null | undefined) {
+export function useBookmark(id: string | null | undefined, options: DetailOptions = {}) {
   return useQuery({
     queryKey: ["bookmark", id],
     queryFn: () => api<BookmarkDetail>(`/bookmarks/${id}`),
     enabled: !!id,
+    ...options,
   });
 }
 
@@ -121,6 +166,8 @@ export function useProgress(nodeId: string | undefined) {
     queryFn: () => api<Progress>(`/progress/${nodeId}`),
     enabled: !!nodeId,
     staleTime: 0,
+    // The reader opens at the first value it sees: never one cached from an earlier visit.
+    gcTime: 0,
   });
 }
 

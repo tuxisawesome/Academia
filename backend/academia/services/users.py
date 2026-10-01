@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 import re
+import shutil
+import unicodedata
 from typing import Any
 
 from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from ..errors import BadRequest, Conflict, NotFound
-from ..models import NOTEBOOK, Node, Source, User, utcnow
-from ..security import generate_password, hash_password, revoke_user_sessions, validate_new_password
-from ..storage import remove_source_files
+from ..models import NOTEBOOK, Job, Node, Source, User, utcnow
+from ..security import generate_password, hash_password, login_limiter, revoke_user_sessions, validate_new_password
+from ..storage import deleted_source_marker, remove_export_files, user_pdf_cache_dir
+from .common import unwanted_in_name
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
@@ -48,6 +51,16 @@ def validate_username(username: str) -> str:
     return username
 
 
+def clean_display_name(name: str | None) -> str:
+    """``name`` without control characters and invisible formatting such as bidi overrides.
+
+    Display names reach administrators' screens, including their terminal (``academia
+    list-users``), where escape sequences could rewrite the output or drive the terminal.
+    """
+    cleaned = "".join(ch for ch in unicodedata.normalize("NFC", name or "") if not unwanted_in_name(ch))
+    return " ".join(cleaned.split())[:128]
+
+
 def find_user(db: Session, username: str) -> User | None:
     return db.scalar(select(User).where(User.username == username.strip()))
 
@@ -70,7 +83,7 @@ def create_user(
         password = generated = generate_password()
     user = User(
         username=username,
-        display_name=(display_name or "").strip()[:128],
+        display_name=clean_display_name(display_name),
         password_hash=hash_password(password),
         is_admin=is_admin,
         must_change_password=must_change,
@@ -107,7 +120,7 @@ def update_user(
     if user is None:
         raise NotFound("User not found.")
     if display_name is not None:
-        user.display_name = display_name.strip()[:128]
+        user.display_name = clean_display_name(display_name)
     if is_admin is not None and is_admin != user.is_admin:
         if user.id == actor.id:
             raise BadRequest("You can't change your own administrator role.", code="self_change")
@@ -123,18 +136,24 @@ def update_user(
             revoke_user_sessions(db, user.id)
         else:
             user.disabled_at = None
+            login_limiter.success(user.username)
     generated = None
     if reset_password:
+        if user.id == actor.id:
+            raise BadRequest("Use Settings → Account to change your own password.", code="self_change")
         generated = generate_password()
         user.password_hash = hash_password(generated)
         user.must_change_password = True
         revoke_user_sessions(db, user.id)
+        # Let the user sign in with the new password straight away, even if locked out.
+        login_limiter.success(user.username)
     db.flush()
     return user, generated
 
 
-def delete_user(db: Session, actor: User | None, user_id: str) -> list[str]:
-    """Delete a user and all of their data. Returns source ids whose files should be removed."""
+def delete_user(db: Session, actor: User | None, user_id: str) -> tuple[list[str], list[str]]:
+    """Delete a user and all of their data. Returns the source and export job ids whose files
+    should be removed (see ``remove_files``)."""
     user = db.get(User, user_id)
     if user is None:
         raise NotFound("User not found.")
@@ -142,18 +161,28 @@ def delete_user(db: Session, actor: User | None, user_id: str) -> list[str]:
         raise BadRequest("You can't delete your own account.", code="self_change")
     _guard_last_admin(db, user)
     source_ids = list(db.scalars(select(Source.id).where(Source.owner_id == user.id)))
+    # Jobs go with the user (ON DELETE CASCADE); their archives are found through these ids.
+    job_ids = list(db.scalars(select(Job.id).where(Job.owner_id == user.id)))
     # Delete the tree first so pages go before the sources they reference.
     db.execute(delete(Node).where(Node.owner_id == user.id, Node.parent_id.is_(None)))
     db.execute(delete(Node).where(Node.owner_id == user.id))
     db.execute(delete(Source).where(Source.owner_id == user.id))
     db.delete(user)
     db.flush()
-    return source_ids
+    return source_ids, job_ids
 
 
-def remove_files(source_ids: list[str]) -> None:
+def remove_files(user_id: str, source_ids: list[str], job_ids: list[str]) -> None:
+    """Remove a deleted user's files. Export archives and cached PDFs go now; uploads are left
+    for maintenance to remove after the grace period that applies to all unused uploads, so
+    that a recent database backup can still be restored with its files."""
     for sid in source_ids:
-        remove_source_files(sid)
+        marker = deleted_source_marker(sid)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.touch()
+    for job_id in job_ids:
+        remove_export_files(job_id)
+    shutil.rmtree(user_pdf_cache_dir(user_id), ignore_errors=True)
 
 
 def list_users(db: Session) -> list[dict[str, Any]]:

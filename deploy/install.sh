@@ -34,14 +34,17 @@ ETC_DIR=/etc/academia
 ENV_FILE=$ETC_DIR/academia.env
 CONF_FILE=$ETC_DIR/install.conf
 STATE_FILE=$APP_ROOT/state
+CADDYFILE=/etc/caddy/Caddyfile
 CADDY_SITE_DIR=/etc/caddy/sites
 CADDY_SITE=$CADDY_SITE_DIR/academia.caddy
 LOG_FILE=/var/log/academia-install.log
-APP_PORT=8750
+CREDENTIALS_FILE=/root/academia-credentials.txt
+APP_PORT=8750 # default; the port in use is ACADEMIA_PORT in $ENV_FILE (see app_port)
 KEEP_RELEASES=3
 
 DEFAULT_REPO=https://github.com/tuxisawesome/Academia.git
 DEFAULT_BRANCH=main
+DEFAULT_TRUSTED_PROXIES=private_ranges
 
 # Pinned toolchain (overridden by deploy/versions.env of the release being installed).
 # shellcheck disable=SC2034
@@ -81,17 +84,24 @@ log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || tr
 run() {
   log "+ $*"
   if ! "$@" >>"$LOG_FILE" 2>&1; then
-    printf '%s\n' "${C_RED}Command failed:${C_RESET} $*" >&2
-    printf '%s\n' "${C_DIM}Last lines of $LOG_FILE:${C_RESET}" >&2
-    tail -n 25 "$LOG_FILE" >&2 || true
+    show_failure "$*"
     return 1
   fi
 }
+
+show_failure() { # show_failure <command>
+  printf '%s\n' "${C_RED}Command failed:${C_RESET} $1" >&2
+  printf '%s\n' "${C_DIM}Last lines of $LOG_FILE:${C_RESET}" >&2
+  tail -n 25 "$LOG_FILE" >&2 || true
+}
+
+ON_ERROR_CLEANUP="" # optional command that on_error runs first (e.g. to put a moved-aside release back)
 
 on_error() {
   local code=$? line=${1:-?}
   # Only report once, from the top-level shell (not from command substitutions).
   ((BASH_SUBSHELL == 0)) || exit "$code"
+  if [[ -n $ON_ERROR_CLEANUP ]]; then $ON_ERROR_CLEANUP || true; fi
   printf '\n%s\n' "${C_RED}${C_BOLD}Academia setup failed${C_RESET} (line $line, exit code $code)." >&2
   printf '%s\n' "Details are in $LOG_FILE. Fix the problem and run the same command again — it is safe to re-run." >&2
   exit "$code"
@@ -137,7 +147,7 @@ ask_yes_no() { # ask_yes_no "Question" y|n  -> returns 0 for yes
 ask_secret() { # ask_secret VAR "Question"
   local __var=$1 question=$2 first second
   while true; do
-    read -r -s -p "  $question: " first </dev/tty || true
+    IFS= read -r -s -p "  $question: " first </dev/tty || true
     printf '\n'
     [[ -z $first ]] && {
       printf -v "$__var" '%s' ""
@@ -147,7 +157,7 @@ ask_secret() { # ask_secret VAR "Question"
       say "    ${C_YELLOW}Please use at least 10 characters.${C_RESET}"
       continue
     fi
-    read -r -s -p "  Repeat the password: " second </dev/tty || true
+    IFS= read -r -s -p "  Repeat the password: " second </dev/tty || true
     printf '\n'
     if [[ $first == "$second" ]]; then
       printf -v "$__var" '%s' "$first"
@@ -179,8 +189,27 @@ arch_name() {
   esac
 }
 
+apt_get() { # like `run apt-get …`, but waits while another apt holds its locks
+  # On a freshly booted server the automatic updates (apt-daily, unattended-upgrades) hold them
+  # for minutes, and apt-get would fail at once. Waits up to about 15 minutes.
+  local i
+  for ((i = 1; ; i++)); do
+    log "+ apt-get $*"
+    if LC_ALL=C.UTF-8 DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=5 "$@" >>"$LOG_FILE" 2>&1; then
+      return 0
+    fi
+    if ((i < 60)) && grep -q 'Could not get lock' < <(tail -n 5 "$LOG_FILE"); then
+      ((i > 1)) || info "    Waiting for the system's automatic updates to finish…"
+      sleep 10
+      continue
+    fi
+    show_failure "apt-get $*"
+    return 1
+  done
+}
+
 apt_install() {
-  DEBIAN_FRONTEND=noninteractive run apt-get install -y -q --no-install-recommends "$@"
+  apt_get install -y -q --no-install-recommends "$@"
 }
 
 conf_get() { # conf_get KEY [default]
@@ -201,13 +230,20 @@ conf_get() { # conf_get KEY [default]
 ssh_port() {
   local port=""
   if command -v sshd >/dev/null 2>&1; then
-    port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}')
+    # sshd -T fails, for example, while /run/sshd doesn't exist yet: port 22 is assumed then.
+    port=$(sshd -T 2>/dev/null | awk '$1 == "port" {print $2; exit}' || true)
   fi
   echo "${port:-22}"
 }
 
 port_owner() { # prints the process listening on TCP port $1 (empty if free)
-  ss -H -ltnp "sport = :$1" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1
+  ss -H -ltnp "sport = :$1" 2>/dev/null | sed -n 's/.*users:(("\([^"]*\)".*/\1/p' | head -n1 || true
+}
+
+app_port() { # the port the app listens on: ACADEMIA_PORT in the settings file
+  local port=""
+  [[ -f $ENV_FILE ]] && port=$(grep -E '^ACADEMIA_PORT=' "$ENV_FILE" | tail -n1 | tr -dc '0-9' || true)
+  echo "${port:-$APP_PORT}"
 }
 
 public_ipv4() {
@@ -217,7 +253,7 @@ public_ipv4() {
 # ---- Toolchain -----------------------------------------------------------------------------
 
 ensure_packages() {
-  run apt-get update -q
+  apt_get update -q
   apt_install ca-certificates curl git gnupg sqlite3 xz-utils tar debian-keyring debian-archive-keyring \
     apt-transport-https iproute2 ufw
   ok "System packages installed"
@@ -231,7 +267,7 @@ ensure_caddy() {
     mv "$key.new" "$key"
   curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' >"$list.new" && mv "$list.new" "$list"
   chmod o+r "$key" "$list"
-  run apt-get update -q
+  apt_get update -q
   apt_install caddy
   ok "Caddy $(caddy version 2>/dev/null | awk '{print $1}') installed"
 }
@@ -241,9 +277,12 @@ ensure_uv() {
   local have=""
   [[ -x $TOOLS_DIR/bin/uv ]] && have=$("$TOOLS_DIR/bin/uv" --version 2>/dev/null | awk '{print $2}')
   if [[ $have != "$UV_VERSION" ]]; then
-    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o /tmp/uv-install.sh
-    run env UV_UNMANAGED_INSTALL="$TOOLS_DIR/bin" INSTALLER_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh
-    rm -f /tmp/uv-install.sh
+    # Downloads go to a private directory: other users could create a fixed name in /tmp first.
+    local tmp
+    tmp=$(mktemp -d)
+    curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" -o "$tmp/uv-install.sh"
+    run env UV_UNMANAGED_INSTALL="$TOOLS_DIR/bin" INSTALLER_NO_MODIFY_PATH=1 sh "$tmp/uv-install.sh"
+    rm -rf "$tmp"
   fi
   ok "uv $("$TOOLS_DIR/bin/uv" --version | awk '{print $2}')"
 }
@@ -262,12 +301,14 @@ ensure_node() {
   dir="$TOOLS_DIR/node-v$NODE_VERSION"
   if [[ ! -x $dir/bin/node ]]; then
     [[ $arch == x64 ]] && sha=$NODE_SHA256_X64 || sha=$NODE_SHA256_ARM64
-    local tarball=/tmp/node-v$NODE_VERSION.tar.xz
+    local tmp tarball
+    tmp=$(mktemp -d)
+    tarball=$tmp/node-v$NODE_VERSION.tar.xz
     curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.xz" -o "$tarball"
     echo "$sha  $tarball" | sha256sum -c --quiet - || die "Node.js download failed its checksum."
     rm -rf "$dir.tmp" && mkdir -p "$dir.tmp"
     tar -xJf "$tarball" -C "$dir.tmp" --strip-components=1
-    rm -f "$tarball"
+    rm -rf "$tmp"
     mv "$dir.tmp" "$dir"
   fi
   ln -sfn "$dir" "$TOOLS_DIR/node"
@@ -287,8 +328,15 @@ ensure_users_and_dirs() {
   install -d -m 0755 -o root -g root "$CACHE_DIR"
   install -d -m 0750 -o "$BUILD_USER" -g "$BUILD_USER" "$CACHE_DIR/build-home" "$CACHE_DIR/uv" "$CACHE_DIR/npm"
   install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR"
+  # The service account owns everything in $DATA_DIR and could have replaced a folder there with
+  # a symbolic link, which root must not follow (install -d would chown its target): root only
+  # resets the owner of the top folders (chown -h never follows a link), and the folders are
+  # made by the service account itself.
+  local sub
   for sub in db sources thumbs cache cache/pdf exports tmp backups; do
-    install -d -m 0750 -o "$APP_USER" -g "$APP_USER" "$DATA_DIR/$sub"
+    [[ ! -L $DATA_DIR/$sub ]] || die "$DATA_DIR/$sub is a symbolic link. Replace it with a folder and try again."
+    if [[ $sub != */* && -d $DATA_DIR/$sub ]]; then chown -h "$APP_USER:$APP_USER" "$DATA_DIR/$sub"; fi
+    runuser -u "$APP_USER" -- install -d -m 0750 "$DATA_DIR/$sub"
   done
   install -d -m 0750 -o root -g "$APP_USER" "$ETC_DIR"
   ok "Service accounts and directories ready"
@@ -304,6 +352,7 @@ write_env_file() {
 # Academia settings. Restart after editing:  sudo systemctl restart academia
 ACADEMIA_DATA_DIR=$DATA_DIR
 ACADEMIA_HOST=127.0.0.1
+# After changing the port, run the installer again so that Caddy follows.
 ACADEMIA_PORT=$APP_PORT
 ACADEMIA_FORWARDED_ALLOW_IPS=127.0.0.1
 # Largest PDF that can be uploaded, in MB.
@@ -328,6 +377,7 @@ DOMAIN="$DOMAIN"
 TLS_MODE="$TLS_MODE"
 ACME_EMAIL="$ACME_EMAIL"
 HTTP_PORT="$HTTP_PORT"
+TRUSTED_PROXIES="$TRUSTED_PROXIES"
 REPO_URL="$REPO_URL"
 BRANCH="$BRANCH"
 EOF
@@ -343,7 +393,8 @@ ensure_source() {
     rm -rf "$SRC_DIR"
     run git clone --no-checkout "$REPO_URL" "$SRC_DIR"
   fi
-  run git -C "$SRC_DIR" fetch --prune --tags origin
+  # --force: a tag that was moved upstream would otherwise make every later fetch fail.
+  run git -C "$SRC_DIR" fetch --prune --tags --force origin
   ok "Source code fetched from $REPO_URL"
 }
 
@@ -396,7 +447,9 @@ build_release() { # build_release <commit>
   cat >"$rel/release.json" <<EOF
 {"version": "${version:-0.0.0}", "commit": "$commit", "build_id": "$BUILD_ID", "built_at": "$(date -u +%FT%TZ)"}
 EOF
-  chown -R "$BUILD_USER:$BUILD_USER" "$rel"
+  # The build user gets only the folders it builds in: the dependencies' install scripts run as
+  # that user, and root later trusts the rest of the release (deploy/, .complete).
+  chown -R "$BUILD_USER:$BUILD_USER" "$rel/backend" "$rel/frontend"
   info "    Installing Python dependencies…"
   run as_build_user "$rel/backend" uv sync --frozen --no-dev --compile-bytecode
   info "    Building the web app…"
@@ -461,13 +514,25 @@ backup_db() { # backup_db <label> -> prints the backup's path (nothing if there 
   fi
 }
 
-restore_db() { # restore_db <backup file>
+restore_db() { # restore_db <backup file>  (academia.service must be stopped)
   local src=$1 db=$DATA_DIR/db/academia.db
   [[ -f $src ]] || return 0
-  rm -f "$db-wal" "$db-shm"
-  cp "$src" "$db"
-  chown "$APP_USER:$APP_USER" "$db"
-  chmod 0640 "$db"
+  # Nothing else may have the database open while it is replaced: a housekeeping or backup job
+  # still running would later write its (deleted) WAL into the restored file.
+  systemctl stop academia-maint.timer academia-backup.timer academia-maint.service academia-backup.service 2>/dev/null || true
+  # As the service account, which owns these files: root would follow symbolic links it made.
+  # shellcheck disable=SC2016  # $1/$2 are expanded by the inner shell
+  runuser -u "$APP_USER" -- bash -c 'cp "$1" "$2.restore" && chmod 0640 "$2.restore" &&
+    rm -f "$2-wal" "$2-shm" && mv -fT "$2.restore" "$2"' _ "$src" "$db"
+  systemctl start academia-maint.timer academia-backup.timer 2>/dev/null || true
+}
+
+keep_rollback_backup() { # keep_rollback_backup <backup file> -> prints the path to record for --rollback
+  # Labelled backups are pruned (backup_db keeps 5), so the one --rollback relies on also gets a
+  # name of its own (a hard link: no extra space while both exist).
+  local src=$1 dest=$DATA_DIR/backups/academia-rollback.db
+  [[ -n $src && -f $src ]] || return 0
+  if ln -f "$src" "$dest" 2>/dev/null; then echo "$dest"; else echo "$src"; fi
 }
 
 migrate() { # migrate <release dir>
@@ -560,7 +625,7 @@ Type=oneshot
 User=$APP_USER
 Group=$APP_USER
 EnvironmentFile=$ENV_FILE
-ExecStart=$CURRENT_LINK/backend/.venv/bin/academia backup --keep 14
+ExecStart=$CURRENT_LINK/backend/.venv/bin/academia backup --label nightly --keep 14
 Nice=10
 $UNIT_HARDENING
 EOF
@@ -583,15 +648,33 @@ EOF
   ok "systemd services installed"
 }
 
-install_wrappers() {
-  local rel=$1
-  install -m 0755 "$rel/deploy/bin/academia-update" /usr/local/bin/academia-update
-  install -m 0755 "$rel/deploy/bin/academia" /usr/local/bin/academia
+install_wrappers() { # install_wrappers <release dir>
+  # Taken from the repository, not from the release: releases built by older installers were
+  # writable by the build user (and so by the dependencies' install scripts).
+  local commit tmp
+  commit=$(basename "$1")
+  tmp=$(mktemp -d)
+  if ! git -C "$SRC_DIR" archive "$commit" deploy/bin 2>/dev/null | tar -x -C "$tmp" 2>/dev/null ||
+    [[ ! -f $tmp/deploy/bin/academia-update || ! -f $tmp/deploy/bin/academia ]]; then
+    rm -rf "$tmp"
+    warn "Could not read the commands of version ${commit:0:12} from $SRC_DIR; the installed ones were kept."
+    return 0
+  fi
+  install -m 0755 "$tmp/deploy/bin/academia-update" /usr/local/bin/academia-update
+  install -m 0755 "$tmp/deploy/bin/academia" /usr/local/bin/academia
+  rm -rf "$tmp"
   ok "Commands installed: academia-update, academia"
 }
 
 render_caddy_site() {
-  local proxy="reverse_proxy 127.0.0.1:$APP_PORT"
+  local proxy="reverse_proxy 127.0.0.1:$(app_port)"
+  if [[ $TLS_MODE == off ]]; then
+    # Behind another proxy or tunnel: use the client address and scheme it passes on, and drop
+    # the hop Caddy appends to X-Forwarded-For (the app trusts only Caddy), so that the app
+    # sees the real client (per-IP sign-in limit) and HTTPS (Secure session cookie).
+    printf -v proxy '%s {\n\t\ttrusted_proxies %s\n\t\theader_up X-Forwarded-For ", [^,]+$" ""\n\t}' \
+      "$proxy" "$TRUSTED_PROXIES"
+  fi
   local errors
   errors=$(
     cat <<'EOF'
@@ -639,13 +722,22 @@ EOF
   } >"$CADDY_SITE.new"
 }
 
+stock_caddyfile() { # true for the Caddyfile of the caddy package (the "Caddy works!" page)
+  [[ $(sed 's/#.*//' "$1" | tr -d '[:space:]') == ':80{root*/usr/share/caddyfile_server}' ]]
+}
+
 install_caddy_site() {
   install -d -m 0755 "$CADDY_SITE_DIR"
   render_caddy_site
+  local main=$CADDYFILE saved
+  # Keep the current files: if Caddy rejects the new configuration they are put back, because
+  # Caddy (and every site it serves) wouldn't start again with an invalid one.
+  saved=$(mktemp -d)
+  [[ -f $CADDY_SITE ]] && cp -p "$CADDY_SITE" "$saved/site"
+  [[ -f $main ]] && cp -p "$main" "$saved/main"
   mv "$CADDY_SITE.new" "$CADDY_SITE"
-  local main=/etc/caddy/Caddyfile
-  if [[ ! -f $main ]] || grep -qE '^\s*root \* /usr/share/caddy' "$main"; then
-    # Stock Caddyfile (the "Caddy works!" page): replace it.
+  if [[ ! -f $main ]] || stock_caddyfile "$main"; then
+    # Stock Caddyfile: replace it. (Any other Caddyfile is kept, with the import added.)
     [[ -f $main ]] && cp "$main" "$main.orig-$(date +%s)"
     cat >"$main" <<'EOF'
 # Sites are defined in /etc/caddy/sites/*.caddy
@@ -655,21 +747,32 @@ EOF
     cp "$main" "$main.orig-$(date +%s)"
     printf '\nimport /etc/caddy/sites/*.caddy\n' >>"$main"
   fi
-  run caddy validate --config "$main" --adapter caddyfile
+  if ! run caddy validate --config "$main" --adapter caddyfile; then
+    if [[ -f $saved/site ]]; then cp -p "$saved/site" "$CADDY_SITE"; else rm -f "$CADDY_SITE"; fi
+    if [[ -f $saved/main ]]; then cp -p "$saved/main" "$main"; else rm -f "$main"; fi
+    rm -rf "$saved"
+    die "Caddy rejected the new web server configuration (see above); the previous one was kept."
+  fi
+  rm -rf "$saved"
   run systemctl enable caddy
   if systemctl is-active --quiet caddy; then run systemctl reload caddy; else run systemctl restart caddy; fi
   ok "Caddy configured for $([[ $TLS_MODE == off ]] && echo "http://<server>:$HTTP_PORT" || echo "https://$DOMAIN")"
 }
 
 configure_firewall() {
-  local sshp
-  sshp=$(ssh_port)
   local active=0
   ufw status 2>/dev/null | grep -q "Status: active" && active=1
-  if [[ $FIREWALL != yes && $active -eq 0 ]]; then
+  # "no" leaves the firewall as it is, as the summary says: with an active UFW it is only "no"
+  # when given with --firewall no (otherwise questions() makes it "yes").
+  if [[ $FIREWALL != yes ]]; then
     ok "Firewall left unchanged"
+    if [[ $active -eq 1 ]]; then
+      warn "UFW is active: make sure it allows $([[ $TLS_MODE == off ]] && echo "port $HTTP_PORT" || echo "ports 80 and 443")."
+    fi
     return
   fi
+  local sshp
+  sshp=$(ssh_port)
   run ufw allow "$sshp/tcp" comment 'SSH'
   if [[ $TLS_MODE == off ]]; then
     run ufw allow "$HTTP_PORT/tcp" comment 'Academia'
@@ -683,9 +786,10 @@ configure_firewall() {
 }
 
 wait_healthy() { # wait_healthy <build id> [seconds]
-  local want=$1 limit=${2:-60} body
+  local want=$1 limit=${2:-60} body port
+  port=$(app_port)
   for ((i = 0; i < limit; i++)); do
-    if body=$(curl -fsS --max-time 3 "http://127.0.0.1:$APP_PORT/api/health" 2>/dev/null); then
+    if body=$(curl -fsS --max-time 3 "http://127.0.0.1:$port/api/health" 2>/dev/null); then
       if [[ $body == *"\"build_id\":\"$want\""* || $body == *"\"build_id\": \"$want\""* ]]; then
         return 0
       fi
@@ -697,7 +801,10 @@ wait_healthy() { # wait_healthy <build id> [seconds]
 
 check_public_url() {
   [[ $TLS_MODE == off ]] && return 0
-  local url="https://$DOMAIN/api/health" curl_opts=(-fsS --max-time 5 --resolve "$DOMAIN:443:127.0.0.1")
+  local url="https://$DOMAIN/api/health" curl_opts=(-fsS --max-time 5)
+  # A name is resolved to this server. An IP address is connected to as it is: Caddy picks the
+  # certificate of an IP address by the address the connection arrives on.
+  is_ipv4 "$DOMAIN" || curl_opts+=(--resolve "$DOMAIN:443:127.0.0.1")
   [[ $TLS_MODE == internal ]] && curl_opts+=(-k)
   for _ in $(seq 1 30); do
     if curl "${curl_opts[@]}" "$url" >/dev/null 2>&1; then
@@ -721,14 +828,17 @@ Usage: sudo $0 [options]
 Every option pre-answers one of the installer's questions; anything not given is asked
 interactively (or takes its default with --yes).
 
-  --domain NAME            Domain name, e.g. academia.example.com
+  --domain NAME            Domain name, e.g. academia.example.com (with --tls internal,
+                           also a host name or the server's IPv4 address)
   --tls MODE               auto (Let's Encrypt, default), internal (self-signed), or off
                            (plain HTTP, when another proxy or tunnel provides HTTPS)
   --http-port PORT         Port for --tls off (default 8080)
+  --trusted-proxies IPS    With --tls off: IP ranges of the proxy or tunnel in front, whose
+                           X-Forwarded-For/-Proto headers are used (default: $DEFAULT_TRUSTED_PROXIES)
   --email ADDRESS          Email for Let's Encrypt expiry notices (optional)
   --admin-user NAME        First administrator's username (default: admin)
   --admin-password PASS    Their password (default: generate a secure one)
-  --firewall yes|no        Enable UFW allowing SSH and web traffic
+  --firewall yes|no        Enable UFW allowing SSH and web traffic (no: don't touch it)
   --repo URL               Git repository (default: $DEFAULT_REPO)
   --branch NAME            Branch, tag or commit to install (default: $DEFAULT_BRANCH)
   -y, --yes                Accept defaults for unanswered questions; don't ask to confirm
@@ -737,7 +847,7 @@ EOF
 }
 
 DOMAIN="" TLS_MODE="" HTTP_PORT="" ACME_EMAIL="" ADMIN_USER="" ADMIN_PASSWORD="" FIREWALL=""
-REPO_URL="" BRANCH="" ASSUME_YES=0 ADMIN_PASSWORD_GENERATED=0 EXISTING_INSTALL=0
+TRUSTED_PROXIES="" REPO_URL="" BRANCH="" ASSUME_YES=0 ADMIN_PASSWORD_GENERATED=0 EXISTING_INSTALL=0
 ARG_ADMIN_PASSWORD_SET=0 ARG_EMAIL_SET=0
 
 parse_args() {
@@ -746,6 +856,7 @@ parse_args() {
       --domain) DOMAIN=${2:?}; shift ;;
       --tls) TLS_MODE=${2:?}; shift ;;
       --http-port) HTTP_PORT=${2:?}; shift ;;
+      --trusted-proxies) TRUSTED_PROXIES=${2:?}; shift ;;
       --email) ACME_EMAIL=${2-}; ARG_EMAIL_SET=1; shift ;;
       --admin-user) ADMIN_USER=${2:?}; shift ;;
       --admin-password) ADMIN_PASSWORD=${2-}; ARG_ADMIN_PASSWORD_SET=1; shift ;;
@@ -760,6 +871,10 @@ parse_args() {
   done
   case ${TLS_MODE:-auto} in auto | internal | off) ;; *) die "--tls must be auto, internal or off." ;; esac
   case ${FIREWALL:-yes} in yes | no) ;; *) die "--firewall must be yes or no." ;; esac
+  [[ -z $ACME_EMAIL ]] || valid_email "$ACME_EMAIL" || die "--email must be one email address, like you@example.com."
+  TRUSTED_PROXIES=${TRUSTED_PROXIES//,/ }
+  [[ -z $TRUSTED_PROXIES ]] || valid_proxies "$TRUSTED_PROXIES" ||
+    die "--trusted-proxies takes IP addresses or ranges, like 10.0.0.0/8 or private_ranges."
 }
 
 preflight() {
@@ -777,9 +892,38 @@ preflight() {
   if [[ -L $CURRENT_LINK && -f $CONF_FILE ]]; then EXISTING_INSTALL=1; fi
 }
 
+is_ipv4() {
+  [[ $1 =~ ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$ ]]
+}
+
+# Top-level domains are letters or punycode (xn--…). With a self-signed certificate, a host name
+# or an IPv4 address also works.
 valid_domain() {
-  [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,63}$ ]] ||
-    [[ $1 =~ ^[A-Za-z0-9-]+$ && $TLS_MODE == internal ]]
+  [[ $1 =~ ^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+([A-Za-z]{2,63}|xn--[A-Za-z0-9-]{0,58}[A-Za-z0-9])$ ]] ||
+    { [[ $TLS_MODE == internal ]] && { [[ $1 =~ ^[A-Za-z0-9-]+$ ]] || is_ipv4 "$1"; }; }
+}
+
+valid_email() { # one plain address: Caddy's "tls" directive accepts nothing else
+  [[ $1 =~ ^[A-Za-z0-9._%+\'-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]
+}
+
+saved_email() { # ACME_EMAIL from install.conf; older installers saved any answer
+  local email
+  email=$(conf_get ACME_EMAIL)
+  if [[ -n $email ]] && ! valid_email "$email"; then
+    warn "Ignoring the saved certificate email '$email': it is not an email address."
+    email=""
+  fi
+  printf '%s' "$email"
+}
+
+valid_proxies() { # IP addresses or CIDR ranges, or Caddy's private_ranges
+  local range ranges
+  read -ra ranges <<<"$1"
+  ((${#ranges[@]})) || return 1
+  for range in "${ranges[@]}"; do
+    [[ $range == private_ranges || $range =~ ^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$ ]] || return 1
+  done
 }
 
 questions() {
@@ -792,7 +936,8 @@ questions() {
     [[ -z $DOMAIN ]] && DOMAIN=$(conf_get DOMAIN)
     [[ -z $TLS_MODE ]] && TLS_MODE=$(conf_get TLS_MODE auto)
     [[ -z $HTTP_PORT ]] && HTTP_PORT=$(conf_get HTTP_PORT 8080)
-    [[ $ARG_EMAIL_SET -eq 0 ]] && ACME_EMAIL=$(conf_get ACME_EMAIL)
+    [[ -z $TRUSTED_PROXIES ]] && TRUSTED_PROXIES=$(conf_get TRUSTED_PROXIES "$DEFAULT_TRUSTED_PROXIES")
+    [[ $ARG_EMAIL_SET -eq 0 ]] && ACME_EMAIL=$(saved_email)
     [[ -z $REPO_URL ]] && REPO_URL=$(conf_get REPO_URL "$DEFAULT_REPO")
     [[ -z $BRANCH ]] && BRANCH=$(conf_get BRANCH "$DEFAULT_BRANCH")
   fi
@@ -832,7 +977,7 @@ questions() {
   else
     while [[ -z $DOMAIN ]] || ! valid_domain "$DOMAIN"; do
       [[ -n $DOMAIN ]] && say "    ${C_YELLOW}'$DOMAIN' doesn't look like a domain name.${C_RESET}"
-      [[ $HAVE_TTY -eq 0 ]] && die "Please pass the domain name with --domain."
+      [[ $HAVE_TTY -eq 0 ]] && die "Please pass a valid domain name with --domain."
       ask DOMAIN "Domain name for Academia (e.g. academia.example.com)" ""
     done
     DOMAIN=${DOMAIN,,}
@@ -841,21 +986,27 @@ questions() {
   # 3. Let's Encrypt email
   if [[ $TLS_MODE == auto && $ARG_EMAIL_SET -eq 0 && $EXISTING_INSTALL -eq 0 && $defaults_only -eq 0 ]]; then
     ask ACME_EMAIL "Email for certificate expiry notices (optional, Enter to skip)" ""
+    while [[ -n $ACME_EMAIL ]] && ! valid_email "$ACME_EMAIL"; do
+      say "    ${C_YELLOW}'$ACME_EMAIL' doesn't look like an email address.${C_RESET}"
+      ask ACME_EMAIL "Email for certificate expiry notices (optional, Enter to skip)" ""
+    done
   fi
 
-  # 4. First administrator (only on a fresh install)
+  # 4. First administrator (asked only on a fresh install; a re-run creates one only if there is
+  #    no account at all, when the first run stopped before creating it)
   if [[ $EXISTING_INSTALL -eq 0 ]]; then
     if [[ -z $ADMIN_USER ]]; then
       if [[ $defaults_only -eq 1 ]]; then ADMIN_USER="admin"; else ask ADMIN_USER "Administrator username" "admin"; fi
     fi
-    [[ $ADMIN_USER =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "Invalid username: $ADMIN_USER"
     if [[ $ARG_ADMIN_PASSWORD_SET -eq 0 && $defaults_only -eq 0 ]]; then
       say "  ${C_DIM}Choose the administrator's password, or press Enter to generate a secure one.${C_RESET}"
       ask_secret ADMIN_PASSWORD "Administrator password"
     fi
-    if [[ -n $ADMIN_PASSWORD ]] && ((${#ADMIN_PASSWORD} < 10)); then
-      die "The administrator password must be at least 10 characters."
-    fi
+  fi
+  ADMIN_USER=${ADMIN_USER:-admin}
+  [[ $ADMIN_USER =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || die "Invalid username: $ADMIN_USER"
+  if [[ -n $ADMIN_PASSWORD ]] && ((${#ADMIN_PASSWORD} < 10)); then
+    die "The administrator password must be at least 10 characters."
   fi
 
   # 5. Firewall
@@ -873,6 +1024,7 @@ questions() {
 
   REPO_URL=${REPO_URL:-$DEFAULT_REPO}
   BRANCH=${BRANCH:-$DEFAULT_BRANCH}
+  TRUSTED_PROXIES=${TRUSTED_PROXIES:-$DEFAULT_TRUSTED_PROXIES}
 
   # Checks that may need the user's attention — still before anything is installed.
   if [[ $TLS_MODE != off ]]; then
@@ -890,12 +1042,13 @@ questions() {
   fi
   if [[ $TLS_MODE == auto ]]; then
     local resolved public
-    resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}')
+    # getent fails for a name without an IPv4 address: that's handled below, not an error.
+    resolved=$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)
     public=$(public_ipv4)
-    if [[ -z $resolved ]]; then
+    if [[ -z $resolved ]] && ! getent ahosts "$DOMAIN" >/dev/null 2>&1; then
       warn "$DOMAIN does not resolve yet. Point its DNS A record at this server; the certificate is issued once it does."
       if [[ $defaults_only -eq 0 ]] && ! ask_yes_no "Continue anyway?" y; then exit 1; fi
-    elif [[ -n $public && $resolved != "$public" ]] && ! hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "$resolved"; then
+    elif [[ -n $resolved && -n $public && $resolved != "$public" ]] && ! hostname -I 2>/dev/null | tr ' ' '\n' | grep -qx "$resolved"; then
       warn "$DOMAIN points to $resolved, but this server's public address seems to be $public."
       if [[ $defaults_only -eq 0 ]] && ! ask_yes_no "Continue anyway?" y; then exit 1; fi
     fi
@@ -907,12 +1060,15 @@ questions() {
   case $TLS_MODE in
     auto) say "    Address:        https://$DOMAIN  (Let's Encrypt${ACME_EMAIL:+, notices to $ACME_EMAIL})" ;;
     internal) say "    Address:        https://$DOMAIN  (self-signed certificate)" ;;
-    off) say "    Address:        http://<this server>:$HTTP_PORT  (put HTTPS in front of it)" ;;
+    off)
+      say "    Address:        http://<this server>:$HTTP_PORT  (put HTTPS in front of it)"
+      say "    Proxies:        $TRUSTED_PROXIES  (trusted to pass on the client's address and HTTPS)"
+      ;;
   esac
   if [[ $EXISTING_INSTALL -eq 0 ]]; then
     say "    Administrator:  $ADMIN_USER  ($([[ -n $ADMIN_PASSWORD ]] && echo "password you chose" || echo "password will be generated"))"
   else
-    say "    Accounts:       unchanged"
+    say "    Accounts:       unchanged  ${C_DIM}(an administrator is created only if there is no account yet)${C_RESET}"
   fi
   say "    Firewall:       $([[ $FIREWALL == yes ]] && echo "UFW on (SSH + web)" || echo "unchanged")"
   say "    Source:         $REPO_URL ($BRANCH)"
@@ -936,7 +1092,7 @@ main_install() {
   chmod 0600 "$LOG_FILE"
   trap 'on_error $LINENO' ERR
   log "Install started: domain=$DOMAIN tls=$TLS_MODE branch=$BRANCH"
-  STEP_TOTAL=10
+  STEP_TOTAL=11
 
   step "Installing system packages"
   ensure_packages
@@ -976,31 +1132,48 @@ main_install() {
   local backup=""
   if db_exists; then
     systemctl stop academia 2>/dev/null || true
-    backup=$(backup_db "pre-install")
+    if ! backup=$(backup_db "pre-install"); then
+      if [[ -n $previous ]]; then systemctl start academia || true; fi
+      die "The database backup failed (is the disk full?). The database was not changed."
+    fi
   fi
-  migrate "$rel"
+  if ! migrate "$rel"; then
+    [[ -n $backup ]] && restore_db "$backup"
+    if [[ -n $previous ]]; then systemctl start academia || true; fi
+    die "The database migration failed${backup:+ (the database was restored from $backup)}. Details are in $LOG_FILE."
+  fi
   switch_current "$commit"
   state_set CURRENT "$commit"
   if [[ -n $previous && $previous != "$commit" ]]; then
     state_set PREVIOUS "$previous"
-    state_set PREVIOUS_DB_BACKUP "$backup"
+    state_set PREVIOUS_DB_BACKUP "$(keep_rollback_backup "$backup")"
   fi
-  if [[ $EXISTING_INSTALL -eq 0 ]]; then
-    local out
-    if [[ -z $ADMIN_PASSWORD ]]; then
-      ADMIN_PASSWORD_GENERATED=1
-      out=$(app_cli "$rel" create-user "$ADMIN_USER" --admin --display-name "Administrator" --if-no-users)
-      ADMIN_PASSWORD=$(sed -n 's/^Temporary password: //p' <<<"$out")
-    else
-      out=$(printf '%s\n' "$ADMIN_PASSWORD" | app_cli "$rel" create-user "$ADMIN_USER" --admin \
-        --display-name "Administrator" --password-stdin --no-force-change --if-no-users)
-    fi
-    log "${out//Temporary password: */Temporary password: <redacted>}"
-    if [[ $out == *"nothing to do"* ]]; then
-      ADMIN_PASSWORD="" ADMIN_PASSWORD_GENERATED=0
-      ok "Existing accounts kept"
-    else
-      ok "Administrator '$ADMIN_USER' created"
+  # Also on a re-run: --if-no-users creates the administrator only if the first run stopped early.
+  local out url cred_file=$CREDENTIALS_FILE
+  if [[ $TLS_MODE == off ]]; then url="http://$(hostname -I | awk '{print $1}'):$HTTP_PORT"; else url="https://$DOMAIN"; fi
+  if [[ -z $ADMIN_PASSWORD ]]; then
+    ADMIN_PASSWORD_GENERATED=1
+    out=$(app_cli "$rel" create-user "$ADMIN_USER" --admin --display-name "Administrator" --if-no-users)
+    ADMIN_PASSWORD=$(sed -n 's/^Temporary password: //p' <<<"$out")
+  else
+    out=$(printf '%s\n' "$ADMIN_PASSWORD" | app_cli "$rel" create-user "$ADMIN_USER" --admin \
+      --display-name "Administrator" --password-stdin --no-force-change --if-no-users)
+  fi
+  log "${out//Temporary password: */Temporary password: <redacted>}"
+  if [[ $out == *"nothing to do"* ]]; then
+    ADMIN_PASSWORD="" ADMIN_PASSWORD_GENERATED=0
+    ok "Existing accounts kept"
+  else
+    ok "Administrator '$ADMIN_USER' created"
+    if [[ $ADMIN_PASSWORD_GENERATED -eq 1 && -n $ADMIN_PASSWORD ]]; then
+      # Saved right away: if a later step fails, a re-run finds the account and can't show it.
+      umask 077
+      printf 'Academia administrator\nURL:      %s\nUsername: %s\nPassword: %s  (temporary — you will choose a new one at first sign-in)\n' \
+        "$url" "$ADMIN_USER" "$ADMIN_PASSWORD" >"$cred_file"
+      umask 022
+      chmod 0600 "$cred_file"
+      state_set ADMIN_CREDENTIALS "$cred_file"
+      ok "Its sign-in details are saved in $cred_file"
     fi
   fi
   ok "Database ready"
@@ -1022,16 +1195,8 @@ main_install() {
   check_public_url
   prune_releases
 
-  local url
-  if [[ $TLS_MODE == off ]]; then url="http://$(hostname -I | awk '{print $1}'):$HTTP_PORT"; else url="https://$DOMAIN"; fi
-  local cred_file=/root/academia-credentials.txt
-  if [[ $ADMIN_PASSWORD_GENERATED -eq 1 && -n $ADMIN_PASSWORD ]]; then
-    umask 077
-    printf 'Academia administrator\nURL:      %s\nUsername: %s\nPassword: %s  (temporary — you will choose a new one at first sign-in)\n' \
-      "$url" "$ADMIN_USER" "$ADMIN_PASSWORD" >"$cred_file"
-    umask 022
-  fi
-
+  local saved_creds
+  saved_creds=$(state_get ADMIN_CREDENTIALS)
   say ""
   say "${C_GREEN}${C_BOLD}Academia is installed.${C_RESET}"
   say ""
@@ -1041,7 +1206,12 @@ main_install() {
     say "              ${C_DIM}(also saved in $cred_file — delete it after signing in)${C_RESET}"
   elif [[ -n $ADMIN_PASSWORD ]]; then
     say "  Sign in as: ${C_BOLD}$ADMIN_USER${C_RESET} with the password you chose."
+  elif [[ -n $saved_creds && -f $saved_creds ]]; then
+    # The administrator was created by an earlier run that stopped before this summary.
+    say "  Sign in with the details saved in ${C_BOLD}$saved_creds${C_RESET}"
+    say "              ${C_DIM}(delete it after signing in)${C_RESET}"
   fi
+  state_set ADMIN_CREDENTIALS ""
   say ""
   say "  Update later with:        ${C_BOLD}sudo academia-update${C_RESET}"
   say "  Manage users from a shell: sudo academia list-users | reset-password NAME | create-user NAME"

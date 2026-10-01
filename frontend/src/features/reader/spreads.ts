@@ -1,4 +1,5 @@
 import type { Prefs } from "../../api/types";
+import { formatRanges, toRanges } from "../../lib/ranges";
 
 /** Same values as pdf.js's SpreadMode. */
 export const Spread = { NONE: 0, ODD: 1, EVEN: 2 } as const;
@@ -30,4 +31,21 @@ export function spreadPages(page: number, total: number, spread: number): number
     start = page % 2 === 0 ? page : page - 1;
   }
   return [start, start + 1].filter((p) => p >= 1 && p <= total);
+}
+
+/**
+ * Labels the pages shown together by their page numbers. A bookmark's pages keep their
+ * notebook numbers, so two pages side by side need not be neighbours: "3, 7", not "3–7".
+ */
+export function spreadLabel(numbers: number[]): string {
+  return formatRanges(toRanges(numbers));
+}
+
+/**
+ * The page to stay on when the layout switches between one and two pages. pdf.js makes the
+ * left page of a spread the current one, so the page the reader was on (`kept`) is restored
+ * while it is still among the pages shown.
+ */
+export function pageAfterLayoutChange(current: number, total: number, spread: number, kept: number | null): number {
+  return kept !== null && spreadPages(current, total, spread).includes(kept) ? kept : current;
 }

@@ -8,7 +8,7 @@ from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 
-from ..config import get_settings
+from ..db import read_session
 from ..errors import BadRequest, Unauthorized
 from ..models import Session, User, utcnow
 from ..security import (
@@ -24,8 +24,8 @@ from ..security import (
     validate_new_password,
     verify_password,
 )
-from ..services.users import DEFAULT_PREFS, find_user, user_json
-from .deps import AnyUser, CurrentUser, Db, session_token
+from ..services.users import DEFAULT_PREFS, clean_display_name, find_user, user_json
+from .deps import AnyUser, CurrentUser, Db, session_token, set_session_cookie
 
 router = APIRouter(tags=["auth"])
 
@@ -50,8 +50,8 @@ class ReaderPrefs(BaseModel):
 
 
 class SortPrefs(BaseModel):
-    key: Literal["name", "modified", "type", "pages"] = "name"
-    dir: Literal["asc", "desc"] = "asc"
+    key: Literal["name", "modified", "type", "pages"] | None = None
+    dir: Literal["asc", "desc"] | None = None
 
 
 class PrefsBody(BaseModel):
@@ -65,19 +65,6 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-def _set_cookie(request: Request, response: Response, token: str) -> None:
-    secure = request.url.scheme == "https"
-    response.set_cookie(
-        SECURE_COOKIE if secure else PLAIN_COOKIE,
-        token,
-        max_age=get_settings().session_days * 86400,
-        path="/",
-        secure=secure,
-        httponly=True,
-        samesite="lax",
-    )
-
-
 def _clear_cookies(response: Response) -> None:
     response.delete_cookie(SECURE_COOKIE, path="/", secure=True, httponly=True, samesite="lax")
     response.delete_cookie(PLAIN_COOKIE, path="/", httponly=True, samesite="lax")
@@ -87,25 +74,35 @@ def _clear_cookies(response: Response) -> None:
 def login(body: LoginBody, request: Request, response: Response, db: Db) -> dict[str, Any]:
     ip = _client_ip(request)
     username = body.username.strip()
-    login_limiter.check(ip, username)
-    user = find_user(db, username) if username else None
-    if user is None:
+    login_limiter.check(username)
+    # Argon2 runs outside any write transaction: holding the database's write lock for it
+    # would make every sign-in and every other write wait in line.
+    with read_session() as rdb:
+        found = find_user(rdb, username) if username else None
+        account = (found.id, found.password_hash) if found else None
+    if account is None:
         burn_verify_time(body.password)
-        login_limiter.failure(ip, username)
+        login_limiter.failure(ip)
         raise Unauthorized("Incorrect username or password.", code="invalid_credentials")
-    if not verify_password(user.password_hash, body.password):
-        login_limiter.failure(ip, username)
+    user_id, password_hash = account
+    if not verify_password(password_hash, body.password):
+        login_limiter.failure(ip)
+        raise Unauthorized("Incorrect username or password.", code="invalid_credentials")
+    login_limiter.success(username)
+    new_hash = hash_password(body.password) if needs_rehash(password_hash) else None
+    user = db.get(User, user_id)
+    if user is None or user.password_hash != password_hash:
+        # Deleted, or the password was changed or reset while it was being verified.
         raise Unauthorized("Incorrect username or password.", code="invalid_credentials")
     if user.disabled_at is not None:
         raise Unauthorized("This account has been disabled. Contact your administrator.", code="disabled")
-    login_limiter.success(username)
-    if needs_rehash(user.password_hash):
-        user.password_hash = hash_password(body.password)
+    if new_hash is not None:
+        user.password_hash = new_hash
     user.last_login_at = utcnow()
     token = create_session(db, user, ip, request.headers.get("user-agent", ""))
     data = user_json(user)
     db.commit()
-    _set_cookie(request, response, token)
+    set_session_cookie(response, token, secure=request.url.scheme == "https")
     return data
 
 
@@ -128,14 +125,22 @@ def me(user: AnyUser) -> dict[str, Any]:
 
 @router.post("/auth/password")
 def change_password(body: PasswordBody, request: Request, user: AnyUser, db: Db) -> dict[str, Any]:
-    live = db.get(User, user.id)
-    assert live is not None
-    if not verify_password(live.password_hash, body.current_password):
+    ip = _client_ip(request)
+    login_limiter.check(user.username)
+    # As in login, Argon2 runs before the write transaction starts.
+    if not verify_password(user.password_hash, body.current_password):
+        login_limiter.failure(ip)
         raise BadRequest("Your current password is incorrect.", code="invalid_password")
+    login_limiter.success(user.username)
     validate_new_password(body.new_password)
     if body.new_password == body.current_password:
         raise BadRequest("Please choose a password you haven't used here.", code="weak_password")
-    live.password_hash = hash_password(body.new_password)
+    new_hash = hash_password(body.new_password)
+    live = db.get(User, user.id)
+    assert live is not None
+    if live.password_hash != user.password_hash:
+        raise BadRequest("Your current password is incorrect.", code="invalid_password")
+    live.password_hash = new_hash
     live.must_change_password = False
     revoke_user_sessions(db, live.id, except_session_id=getattr(request.state, "session_id", None))
     data = user_json(live)
@@ -155,7 +160,7 @@ def update_profile(body: ProfileBody, user: CurrentUser, db: Db) -> dict[str, An
     live = db.get(User, user.id)
     assert live is not None
     if body.display_name is not None:
-        live.display_name = body.display_name.strip()
+        live.display_name = clean_display_name(body.display_name)
     data = user_json(live)
     db.commit()
     return data

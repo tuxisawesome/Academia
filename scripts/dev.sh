@@ -18,7 +18,10 @@ cd "$ROOT/backend"
 uv run academia migrate >/dev/null
 uv run academia create-user admin --admin --password academia-dev --no-force-change --if-no-users
 
-trap 'kill 0' EXIT INT TERM
+# On exit, stop both servers. `kill 0` also signals this script, so TERM is ignored first
+# (a TERM trap that runs `kill 0` again would recurse until bash crashes).
+trap 'exit 130' INT TERM
+trap 'trap "" TERM; kill 0' EXIT
 uv run uvicorn --factory academia.main:create_app --host 127.0.0.1 --port "$PORT" --reload --reload-dir academia &
 (cd "$ROOT/frontend" && npm run dev -- --host 127.0.0.1) &
 wait

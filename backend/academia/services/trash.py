@@ -49,12 +49,15 @@ def trash_nodes(db: Session, user_id: str, ids: Sequence[str]) -> int:
 
 def notebook_dependents(db: Session, user_id: str, ids: Sequence[str]) -> dict[str, Any]:
     """Bookmarks outside the selection that point at notebooks inside it."""
-    subtree = set(descendant_ids(db, [owned_node(db, user_id, i).id for i in ids], live_only=True))
-    nb_ids = list(db.scalars(select(Node.id).where(Node.id.in_(list(subtree)), Node.kind == NOTEBOOK)))
-    outside = [b for b in bookmarks_pointing_at(db, nb_ids) if b not in subtree]
-    live_outside = (
-        list(db.scalars(select(Node.id).where(Node.id.in_(outside), Node.trashed_at.is_(None)))) if outside else []
-    )
+    subtree = descendant_ids(db, [owned_node(db, user_id, i).id for i in ids], live_only=True)
+    nb_ids: list[str] = []
+    for part in chunks(subtree):
+        nb_ids.extend(db.scalars(select(Node.id).where(Node.id.in_(part), Node.kind == NOTEBOOK)))
+    inside = set(subtree)
+    outside = [b for b in bookmarks_pointing_at(db, nb_ids) if b not in inside]
+    live_outside: list[str] = []
+    for part in chunks(outside):
+        live_outside.extend(db.scalars(select(Node.id).where(Node.id.in_(part), Node.trashed_at.is_(None))))
     return {"bookmarks_elsewhere": len(live_outside)}
 
 
@@ -136,12 +139,23 @@ def purge_roots(db: Session, root_ids: Sequence[str], user_id: str | None = None
         node_ids.extend(db.scalars(stmt))
     if not node_ids:
         return 0
+    purged = set(node_ids)
+    # Items trashed on their own from inside a purged folder are separate Trash entries. Move
+    # them to the top level (where restoring them would put them anyway) so that deleting the
+    # folder does not cascade to them.
+    kept: list[str] = []
+    for part in chunks(node_ids):
+        kept.extend(i for i in db.scalars(select(Node.id).where(Node.parent_id.in_(part))) if i not in purged)
+    for part in chunks(kept):
+        db.execute(
+            update(Node).where(Node.id.in_(part)).values(parent_id=None).execution_options(synchronize_session=False)
+        )
     nb_ids = []
     for part in chunks(node_ids):
         nb_ids.extend(db.scalars(select(Node.id).where(Node.id.in_(part), Node.kind == NOTEBOOK)))
     sources = _source_ids_of_notebooks(db, nb_ids)
     # Bookmarks anywhere that point at a purged notebook would be left dangling.
-    dangling = [b for b in bookmarks_pointing_at(db, nb_ids) if b not in set(node_ids)]
+    dangling = [b for b in bookmarks_pointing_at(db, nb_ids) if b not in purged]
     for part in chunks(dangling):
         db.execute(delete(Node).where(Node.id.in_(part)).execution_options(synchronize_session=False))
     for part in chunks(node_ids):

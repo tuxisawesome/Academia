@@ -27,7 +27,7 @@ A self-hosted library for PDFs, with **Notebooks** and **Bookmarks** kept in fol
 - **Reader**:
   - two pages side by side on wide screens, one page on phones
   - keyboard, click and swipe to turn pages
-  - page thumbnails, bookmarks panel, zoom and fullscreen
+  - page thumbnails, bookmarks panel, zoom (pinch on touch screens) and fullscreen
   - reopens where you left off
 - **Accounts**:
   - private libraries per user
@@ -68,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/tuxisawesome/Academia/main/deploy/i
 - the administrator's username and password (press Enter to generate one)
 - whether to enable the firewall
 
-It then shows a summary and asks for confirmation. After that it runs unattended to the end, which takes about 5 minutes. When it finishes, it prints the address and the administrator's sign-in details. A generated password is also saved to `/root/academia-credentials.txt`, and you're asked to change it at first sign-in.
+It then shows a summary and asks for confirmation. After that it runs unattended to the end, which takes about 5 minutes. When it finishes, it prints the address and the administrator's sign-in details. A generated password is also saved to `/root/academia-credentials.txt` as soon as the account is created, and you're asked to change it at first sign-in. If the installation stops with an error, fix the problem and run the same command again; it keeps the account (or creates it if it doesn't exist yet).
 
 Every question can be answered in advance, which makes the install fully non-interactive:
 
@@ -79,12 +79,13 @@ sudo ./deploy/install.sh --domain academia.example.com --email you@example.com \
 
 | Option | Meaning |
 |---|---|
-| `--domain NAME` | Domain name for the site |
+| `--domain NAME` | Domain name for the site (with `--tls internal`, also a host name or the server's IPv4 address) |
 | `--tls auto\|internal\|off` | Let's Encrypt (default), self-signed, or plain HTTP behind another proxy |
 | `--http-port PORT` | Port used with `--tls off` (default 8080) |
+| `--trusted-proxies IPS` | With `--tls off`: IP ranges of the proxy or tunnel in front of Academia. Its `X-Forwarded-For` and `X-Forwarded-Proto` headers give Academia the client's address and HTTPS. Default: `private_ranges` (this server and private networks) |
 | `--email ADDRESS` | Email for Let's Encrypt notices |
 | `--admin-user NAME`, `--admin-password PASS` | First administrator (default: `admin`, generated password) |
-| `--firewall yes\|no` | Enable UFW, allowing only SSH (on its real port), HTTP and HTTPS |
+| `--firewall yes\|no` | `yes`: enable UFW, allowing only SSH (on its real port), HTTP and HTTPS. `no`: leave the firewall as it is |
 | `--repo URL`, `--branch NAME` | Install from another repository or branch/tag |
 | `-y, --yes` | Use defaults for anything not given and skip the confirmation |
 
@@ -111,9 +112,11 @@ Running the installer again is safe. It repairs or updates the installation and 
 ```bash
 sudo academia-update              # update to the newest version of the installed branch
 sudo academia-update --check      # only check whether an update is available
-sudo academia-update --ref v1.2.0 # update (or downgrade) to a specific tag, branch or commit
+sudo academia-update --ref v1.2.0 # update to a specific tag, branch or commit
 sudo academia-update --rollback   # go back to the version before the last update
 ```
+
+`--ref` can also go back to an older version, but only to one with the same database layout: an older version can't read a database that a newer one has migrated, so such a downgrade is aborted (and nothing is changed). To undo the last update, use `--rollback`, which also restores the database from before it.
 
 **How an update runs:**
 1. The new version is built in its own folder while the current one keeps serving.
@@ -123,7 +126,7 @@ sudo academia-update --rollback   # go back to the version before the last updat
 
 **If something goes wrong:**
 - If the migration or the start-up check fails, the previous version and database are restored automatically.
-- `--rollback` also restores the database backup taken just before the last update. Changes made since that update are lost, so it asks first.
+- `--rollback` also restores the database backup taken just before the last update (kept as `/var/lib/academia/backups/academia-rollback.db`). Changes made since that update are lost, so it asks first.
 
 After an update, open browser tabs show **"Academia has been updated — Reload"**.
 
@@ -150,6 +153,7 @@ After an update, open browser tabs show **"Academia has been updated — Reload"
   | `ACADEMIA_MAX_UPLOAD_MB` | 1024 | Largest PDF that can be uploaded |
   | `ACADEMIA_PDF_CACHE_MAX_MB` | 4096 | Disk space for generated PDFs (rebuilt when needed) |
   | `ACADEMIA_PDF_WORKERS` | half the CPU cores, at most 4 | Parallel PDF rendering and assembly |
+  | `ACADEMIA_PORT` | 8750 | Local port of the app (only Caddy connects to it). After changing it, run the installer again so that Caddy follows |
 
 ### Backups and restore
 
@@ -164,26 +168,28 @@ The nightly timer keeps 14 database backups in `/var/lib/academia/backups`.
 
 ```bash
 sudo academia backup --label manual --keep 0      # consistent copy of the database
-sudo tar -C /var/lib/academia -czf academia-backup.tgz db/academia.db backups sources
+sudo tar -C /var/lib/academia -czf academia-backup.tgz backups sources
 ```
+
+The archive deliberately leaves out the live `db/academia.db`: while Academia runs, recent changes are still in `db/academia.db-wal`, so a plain copy of that file can be incomplete or damaged. The newest `academia-manual-*.db` file in `backups/` is the consistent copy.
 
 **To restore a database backup:**
 
 ```bash
 sudo systemctl stop academia
-sudo cp /var/lib/academia/backups/academia-nightly-YYYYMMDD-HHMMSS.db /var/lib/academia/db/academia.db
-sudo rm -f /var/lib/academia/db/academia.db-wal /var/lib/academia/db/academia.db-shm
-sudo chown academia:academia /var/lib/academia/db/academia.db
+sudo -u academia cp /var/lib/academia/backups/academia-nightly-YYYYMMDD-HHMMSS.db /var/lib/academia/db/academia.db
+sudo -u academia rm -f /var/lib/academia/db/academia.db-wal /var/lib/academia/db/academia.db-shm
 sudo systemctl start academia
 ```
 
-Uploaded PDFs that are no longer used are kept for 21 days before being deleted. Restoring a database backup from the last two weeks therefore never refers to missing files.
+Uploaded PDFs that are no longer used, including those of deleted users, are kept for 21 days before being deleted. Restoring a database backup from the last two weeks therefore never refers to missing files.
 
 **To move to a new server:**
-1. Install Academia there.
-2. Stop the service.
-3. Copy `db/academia.db` and `sources/` into `/var/lib/academia`, then run `sudo chown -R academia:academia /var/lib/academia`.
-4. Start the service.
+1. On the old server, run `sudo systemctl stop academia`, then `sudo academia backup --label manual --keep 0`. It prints the path of a consistent copy of the database.
+2. Install Academia on the new server, then stop the service there with `sudo systemctl stop academia`.
+3. Copy that backup to `/var/lib/academia/db/academia.db` on the new server, and copy `sources/` into `/var/lib/academia`.
+4. On the new server, run `sudo rm -f /var/lib/academia/db/academia.db-wal /var/lib/academia/db/academia.db-shm`, then `sudo chown -R academia:academia /var/lib/academia`.
+5. Start the service with `sudo systemctl start academia`.
 
 ### Uninstalling
 
@@ -200,7 +206,10 @@ sudo rm -rf /opt/academia /etc/academia /usr/local/bin/academia /usr/local/bin/a
 - **The site doesn't load over HTTPS.**
   - Check that the domain's DNS points at the server and that ports 80 and 443 are open (including any cloud firewall).
   - Then look at `sudo journalctl -u caddy -n 100`. The certificate is issued automatically as soon as the domain resolves.
-- **You're locked out.** `sudo academia reset-password <user>` prints a new temporary password.
+- **"Request blocked: unexpected origin." behind your own proxy (`--tls off`).** This can happen in older browsers when the proxy changes the `Host` header.
+  - Make the proxy pass on the original `Host` header (with nginx: `proxy_set_header Host $host;`).
+  - Or add the public address to `/etc/academia/academia.env` as `ACADEMIA_EXTRA_ORIGINS='["https://academia.example.com"]'`, then run `sudo systemctl restart academia`.
+- **You're locked out.** `sudo academia reset-password <user>` prints a new temporary password. If sign-in then still reports too many failed attempts, wait 15 minutes or run `sudo systemctl restart academia`. (A reset from the Users page in the app lifts that limit straight away.)
 - **An update failed.** It was rolled back automatically, and the reason is in `/var/log/academia-install.log` and `sudo journalctl -u academia`.
 
 ## Development

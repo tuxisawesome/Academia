@@ -45,9 +45,12 @@ def test_page_operations_model(data_dir, ops):  # noqa: ANN001
         bm = bms.create_bookmark(db, uid, None, "B", nb_id, initial[:1])
         bm_id = bm.id
 
+    # Deleted pages keep their place in the full order until they are restored.
+    full: list[str] = list(initial)
+    hidden: set[str] = set()
     model: list[str] = list(initial)
     marked: set[str] = {initial[0]}
-    deleted: dict[str, list[tuple[int, str]]] = {}
+    deleted: dict[str, list[str]] = {}
     batches: list[str] = []
 
     for op in ops:
@@ -63,8 +66,8 @@ def test_page_operations_model(data_dir, ops):  # noqa: ANN001
                 new_ids = ps.insert_source(
                     db, uid, nb_id, None, sources[src_i], at=at, after_page_id=after, add_to_bookmarks=touched
                 )
-                k = 0 if at == "start" else (model.index(after) + 1 if after else len(model))
-                model[k:k] = new_ids
+                k = 0 if at == "start" else (full.index(after) + 1 if after else len(full))
+                full[k:k] = new_ids
                 if add:
                     marked.update(new_ids)
             elif kind == "reorder":
@@ -72,19 +75,25 @@ def test_page_operations_model(data_dir, ops):  # noqa: ANN001
                 perm = list(model)
                 rnd.shuffle(perm)
                 ps.reorder(db, uid, nb_id, None, perm)
-                model = perm
+                following: dict[str | None, list[str]] = {}
+                prev = None
+                for p in full:
+                    if p in hidden:
+                        following.setdefault(prev, []).append(p)
+                    else:
+                        prev = p
+                full = following.get(None, []) + [q for p in perm for q in [p, *following.get(p, [])]]
             elif kind == "delete" and model:
                 rnd = op[1]
                 chosen = rnd.sample(model, rnd.randint(1, len(model)))
                 batch = ps.delete_pages(db, uid, nb_id, None, chosen)
-                deleted[batch] = sorted((model.index(p), p) for p in chosen)
+                deleted[batch] = chosen
                 batches.append(batch)
-                model = [p for p in model if p not in chosen]
+                hidden.update(chosen)
             elif kind == "undelete" and batches:
                 batch = batches.pop(op[1] % len(batches))
                 ps.undelete(db, uid, nb_id, batch)
-                for pos, pid in deleted.pop(batch):
-                    model.insert(min(pos, len(model)), pid)
+                hidden.difference_update(deleted.pop(batch))
             elif kind == "rotate" and model:
                 rnd = op[1]
                 ps.rotate(db, uid, nb_id, None, rnd.sample(model, 1), 90)
@@ -94,6 +103,7 @@ def test_page_operations_model(data_dir, ops):  # noqa: ANN001
                 bms.set_bookmark_pages(db, uid, bm_id, chosen)
                 live = set(model)
                 marked = {p for p in marked if p not in live} | set(chosen)
+            model = [p for p in full if p not in hidden]
 
         with read_session() as db:
             rows = db.execute(

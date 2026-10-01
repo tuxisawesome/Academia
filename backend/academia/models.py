@@ -187,6 +187,7 @@ class Page(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     deleted_at: Mapped[datetime | None]
     deleted_batch: Mapped[str | None] = mapped_column(String(36), index=True)
+    # Place among live and other deleted pages, kept up to date for undo (see services/pages.py).
     deleted_position: Mapped[int | None] = mapped_column(Integer)
 
 
@@ -256,8 +257,9 @@ class PageText(Base):
     Never shown to users.
 
     A row exists once the page has been processed (``body`` is empty if the page has no
-    text layer, e.g. scanned handwriting). The ``page_text_fts`` full-text index is kept in
-    sync by triggers (see migration 0002). A future migration that alters this table in
+    text layer, e.g. scanned handwriting); it is stored in the form ``search.index_text``
+    gives it. The ``page_text_fts`` full-text index is kept in sync by triggers (see
+    migration 0003). A future migration that alters this table in
     Alembic batch mode recreates the table, which drops those triggers: such a migration
     must create them again.
     """

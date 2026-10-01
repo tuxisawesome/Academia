@@ -17,6 +17,7 @@ from ..db import read_session, write_session
 from ..models import PageText, Source, utcnow
 from ..storage import source_path
 from ..workers import pdfops, pool
+from .search import index_text
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ def index_source(source_id: str) -> int:
             have = set(db.scalars(select(PageText.idx).where(PageText.source_id == source_id, PageText.idx.in_(chunk))))
             now = utcnow()
             db.add_all(
-                PageText(source_id=source_id, idx=idx, body=texts.get(idx, ""), updated_at=now)
+                PageText(source_id=source_id, idx=idx, body=index_text(texts.get(idx, "")), updated_at=now)
                 for idx in chunk
                 if idx not in have
             )

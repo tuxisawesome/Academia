@@ -1,9 +1,11 @@
 """Assembled PDFs for notebooks and bookmarks, cached by the hash of what goes into them.
 
 A *spec* lists the title, the (source, page, rotation) of every page, the outline and the
-page labels. Its SHA-256 names the cached file, so a cached PDF never changes after it is
-written (safe for HTTP range requests), identical content is built once, and there is no
-invalidation to get wrong. Maintenance trims the cache by least-recent use.
+page labels. Its SHA-256, together with the version of the code that assembles it, names
+the cached file, so a cached PDF never changes after it is written (safe for HTTP range
+requests), identical content is built once, and there is no invalidation to get wrong. The
+cache is trimmed by least-recent use after each build and by the nightly maintenance. Each
+user's files live in their own directory, which is removed together with the user.
 """
 
 from __future__ import annotations
@@ -16,11 +18,13 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..models import Node
 from ..storage import pdf_cache_path, source_path
 from ..workers import pdfops, pool
 from .bookmarks import live_bookmark_pages, require_bookmark
 from .common import segments
+from .maintenance import trim_pdf_cache
 from .pages import notebook_bookmarks
 from .tree import require_notebook
 
@@ -84,20 +88,23 @@ def bookmark_spec(db: Session, user_id: str, bookmark_id: str, with_outline: boo
 
 
 def spec_digest(spec: dict[str, Any]) -> str:
-    canonical = json.dumps(spec, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    keyed = [pdfops.ASSEMBLE_VERSION, spec]
+    canonical = json.dumps(keyed, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def ensure_pdf(spec: dict[str, Any]) -> tuple[Path, str]:
+def ensure_pdf(owner_id: str, spec: dict[str, Any]) -> tuple[Path, str]:
     """Return the cached PDF for ``spec``, building it in a worker process if needed."""
     digest = spec_digest(spec)
-    path = pdf_cache_path(digest)
+    path = pdf_cache_path(owner_id, digest)
     if not path.exists():
         with _locks.get(digest):
             if not path.exists():
                 resolved = dict(spec)
                 resolved["pages"] = [[str(source_path(sid)), idx, rot] for sid, idx, rot in spec["pages"]]
                 pool.run(pdfops.assemble, resolved, str(path))
+                # Each edit of a notebook adds a PDF, so the size limit must hold between nightly trims too.
+                trim_pdf_cache(get_settings().pdf_cache_max_mb * 1024 * 1024, keep=path)
     try:
         os.utime(path)  # recency for cache trimming
     except OSError:

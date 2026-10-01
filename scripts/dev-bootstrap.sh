@@ -18,6 +18,11 @@ node_ok() {
   command -v node >/dev/null 2>&1 && [ "$(node -p 'process.versions.node.split(".")[0]')" -ge "${NODE_MAJOR}" ]
 }
 if ! node_ok && [ ! -x "$HOME/.local/node/bin/node" ]; then
+  case "$(uname -s)" in
+    Linux) os=linux ;;
+    Darwin) os=darwin ;;
+    *) echo "Unsupported operating system: $(uname -s)" >&2; exit 1 ;;
+  esac
   case "$(uname -m)" in
     x86_64) arch=x64 ;;
     aarch64 | arm64) arch=arm64 ;;
@@ -25,7 +30,7 @@ if ! node_ok && [ ! -x "$HOME/.local/node/bin/node" ]; then
   esac
   echo "Installing Node.js ${NODE_VERSION}…"
   tmp="$(mktemp -d)"
-  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${arch}.tar.xz" -o "$tmp/node.tar.xz"
+  curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-${os}-${arch}.tar.xz" -o "$tmp/node.tar.xz"
   mkdir -p "$HOME/.local/node"
   tar -xJf "$tmp/node.tar.xz" -C "$HOME/.local/node" --strip-components=1
   rm -rf "$tmp"

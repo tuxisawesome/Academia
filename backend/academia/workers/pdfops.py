@@ -6,6 +6,7 @@ thread-safe, so it must only ever be used from these single-threaded worker proc
 
 from __future__ import annotations
 
+import contextlib
 import os
 from typing import Any
 
@@ -25,6 +26,41 @@ def _normalized_rotation(value: Any) -> int:
     except (TypeError, ValueError):
         return 0
     return (round(rot / 90) * 90) % 360
+
+
+def _box(value: Any) -> tuple[float, float, float, float]:
+    x0, y0, x1, y1 = (float(v) for v in value)
+    return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+
+def _visible_size(page: Any) -> tuple[float, float]:
+    """Width and height of what viewers show: the CropBox clipped to the MediaBox, as in
+    pdfium (thumbnails) and pdf.js (the reader)."""
+    mx0, my0, mx1, my1 = _box(page.mediabox)
+    cx0, cy0, cx1, cy1 = _box(page.cropbox)
+    width, height = min(mx1, cx1) - max(mx0, cx0), min(my1, cy1) - max(my0, cy0)
+    if width <= 0 or height <= 0:  # they do not overlap: pdf.js shows the MediaBox
+        return mx1 - mx0, my1 - my0
+    return width, height
+
+
+def _fsync(path: str) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _publish(part: str, dest_path: str) -> None:
+    """Give a finished temporary file its final name, durably: after a crash or a power
+    loss the file is complete or absent, never empty or cut short."""
+    _fsync(part)
+    os.replace(part, dest_path)
+    try:
+        _fsync(os.path.dirname(dest_path))
+    except OSError:  # not every file system can sync a directory
+        pass
 
 
 def ingest(tmp_path: str, dest_path: str) -> dict[str, Any]:
@@ -48,23 +84,29 @@ def ingest(tmp_path: str, dest_path: str) -> dict[str, Any]:
         sizes: list[tuple[float, float]] = []
         for page in pdf.pages:
             try:
-                x0, y0, x1, y1 = (float(v) for v in page.cropbox)
-                width, height = abs(x1 - x0), abs(y1 - y0)
+                width, height = _visible_size(page)
             except (ValueError, TypeError, pikepdf.PdfError):
                 width, height = 612.0, 792.0
             if width < 1 or height < 1:
                 width, height = 612.0, 792.0
-            rot = _normalized_rotation(page.obj.get("/Rotate", 0))
-            if rot != int(page.obj.get("/Rotate", 0) or 0):
+            raw = page.obj.get("/Rotate", 0)
+            rot = _normalized_rotation(raw)
+            if type(raw) is not int or raw != rot:
+                # Store a plain multiple of 90, which every PDF tool reads alike (not 90.0 or /Foo).
                 page.obj.Rotate = rot
             if rot in (90, 270):
                 width, height = height, width
             sizes.append((round(width, 2), round(height, 2)))
-        part = dest_path + ".part"
+        part = f"{dest_path}.{os.getpid()}.part"
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         # Saving without `encryption` drops any owner-password encryption.
-        pdf.save(part)
-    os.replace(part, dest_path)
+        try:
+            pdf.save(part)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(part)
+            raise
+    _publish(part, dest_path)
     return {"page_count": count, "sizes": sizes}
 
 
@@ -92,7 +134,9 @@ def render_thumbnails(source_path: str, items: list[tuple[int, int, str]]) -> in
                 bitmap = page.render(scale=max(scale, 0.05), may_draw_forms=True)
                 image = bitmap.to_pil().convert("RGB")
                 os.makedirs(os.path.dirname(out_path), exist_ok=True)
-                part = out_path + ".part"
+                # A name of its own: another worker may be rendering the same thumbnail. Not
+                # fsynced: a crash can leave an empty thumbnail, which is then rendered again.
+                part = f"{out_path}.{os.getpid()}.part"
                 image.save(part, "WEBP", quality=78, method=4)
                 os.replace(part, out_path)
                 written += 1
@@ -101,6 +145,11 @@ def render_thumbnails(source_path: str, items: list[tuple[int, int, str]]) -> in
     finally:
         doc.close()
     return written
+
+
+# Part of the cache key of every assembled PDF (see pdfbuild.spec_digest): bump it whenever
+# assemble() changes what it writes, so that PDFs built by an older release are not served.
+ASSEMBLE_VERSION = 2
 
 
 def assemble(spec: dict[str, Any], dest_path: str) -> str:
@@ -127,7 +176,8 @@ def assemble(spec: dict[str, Any], dest_path: str) -> str:
         # makes a shallow copy of the first copy, which must not carry its rotation yet.
         for page, (_src, _idx, rotation) in zip(out.pages, spec["pages"], strict=True):
             if rotation:
-                page.rotate(int(rotation), relative=True)
+                # Not page.rotate(relative=True), which takes a /Rotate such as 90.0 for 0.
+                page.obj.Rotate = (_normalized_rotation(page.obj.get("/Rotate", 0)) + int(rotation)) % 360
 
         outline = spec.get("outline") or []
         if outline:
@@ -163,7 +213,7 @@ def assemble(spec: dict[str, Any], dest_path: str) -> str:
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         part = f"{dest_path}.{os.getpid()}.part"
         out.save(part, linearize=True)
-        os.replace(part, dest_path)
+        _publish(part, dest_path)
     finally:
         for pdf in opened.values():
             pdf.close()

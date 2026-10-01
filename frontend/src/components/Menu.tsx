@@ -1,8 +1,9 @@
 import { ContextMenu, DropdownMenu } from "radix-ui";
 import { Check, ChevronRight } from "lucide-react";
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import type { FolderColor } from "../api/types";
 import { FOLDER_COLORS, folderColorVar } from "../lib/colors";
+import { useIsNarrow } from "../lib/hooks";
 
 /** Menu contents as data, so the same entries render as a right-click menu or a dropdown. */
 export type MenuEntry =
@@ -35,6 +36,7 @@ function tidy(entries: MenuEntry[]): MenuEntry[] {
 }
 
 function Entries({ parts: P, entries }: { parts: Parts; entries: MenuEntry[] }) {
+  const narrow = useIsNarrow();
   return (
     <>
       {tidy(entries).map((entry, i) => {
@@ -45,12 +47,21 @@ function Entries({ parts: P, entries }: { parts: Parts; entries: MenuEntry[] }) 
               {entry.label}
             </P.Label>
           );
+        // On a phone there is no room beside the menu for a submenu, and Radix never shifts one
+        // sideways, so whole columns of swatches would be off-screen: show them inline instead.
+        if (entry.type === "sub" && narrow && !entry.disabled && entry.items.every((e) => e.type === "colors"))
+          return (
+            <Fragment key={i}>
+              <P.Label className="menu-label">{entry.label}</P.Label>
+              <Entries parts={P} entries={entry.items} />
+            </Fragment>
+          );
         if (entry.type === "sub")
           return (
             <P.Sub key={i}>
               <P.SubTrigger className="menu-item" disabled={entry.disabled}>
                 {entry.icon}
-                <span>{entry.label}</span>
+                <span className="truncate">{entry.label}</span>
                 <ChevronRight className="chev" />
               </P.SubTrigger>
               <P.Portal>
@@ -97,7 +108,7 @@ function Entries({ parts: P, entries }: { parts: Parts; entries: MenuEntry[] }) 
             ) : (
               entry.icon
             )}
-            <span>{entry.label}</span>
+            <span className="truncate">{entry.label}</span>
             {entry.shortcut && <span className="shortcut">{entry.shortcut}</span>}
           </P.Item>
         );
@@ -106,10 +117,17 @@ function Entries({ parts: P, entries }: { parts: Parts; entries: MenuEntry[] }) 
   );
 }
 
-export function ContextMenuContent({ entries }: { entries: MenuEntry[] }) {
+export function ContextMenuContent({
+  entries,
+  onCloseAutoFocus,
+}: {
+  entries: MenuEntry[];
+  /** Called before focus returns to the trigger; preventDefault() keeps focus elsewhere. */
+  onCloseAutoFocus?: (e: Event) => void;
+}) {
   return (
     <ContextMenu.Portal>
-      <ContextMenu.Content className="menu" collisionPadding={8}>
+      <ContextMenu.Content className="menu" collisionPadding={8} onCloseAutoFocus={onCloseAutoFocus}>
         <Entries parts={ContextMenu} entries={entries} />
       </ContextMenu.Content>
     </ContextMenu.Portal>

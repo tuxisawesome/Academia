@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { onSessionEnd } from "../api/queries";
 
 export interface ConfirmOptions {
   title: string;
@@ -35,6 +36,14 @@ export const useDialogs = create<DialogState>((set) => ({
   open: (pending) => set({ pending }),
   close: () => set({ pending: null }),
 }));
+
+// A confirm or prompt still open when the session ends is cancelled, not answered by the next user.
+onSessionEnd(() => {
+  const pending = useDialogs.getState().pending;
+  if (pending?.type === "confirm") pending.resolve(false);
+  else if (pending?.type === "prompt") pending.resolve(null);
+  useDialogs.getState().close();
+});
 
 export function confirmDialog(options: ConfirmOptions): Promise<boolean> {
   return new Promise((resolve) => useDialogs.getState().open({ type: "confirm", options, resolve }));

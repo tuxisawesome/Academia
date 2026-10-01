@@ -12,6 +12,7 @@ import { formatBytes, plural } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
 import { toast } from "../../state/toasts";
 import { Breadcrumbs } from "../explorer/ExplorerPage";
+import { afterPageNumber, listedBookmarkIds } from "./uploadPosition";
 
 interface QueuedFile {
   key: number;
@@ -31,35 +32,43 @@ export function UploadPage() {
   const { id } = useParams();
   const [params] = useSearchParams();
   const navigate = useNavigate();
-  const { data: nb, isLoading } = useNotebook(id);
+  const { data: nb, isLoading, error: loadError } = useNotebook(id);
   useDocumentTitle(nb ? `Add PDF · ${nb.name}` : "Add PDF");
   const [queue, setQueue] = useState<QueuedFile[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const aborts = useRef(new Map<number, () => void>());
   const initialAfter = params.get("after");
   const [position, setPosition] = useState<Position>(
     initialAfter ? "after" : params.get("at") === "start" ? "start" : "end",
   );
-  const [afterNumber, setAfterNumber] = useState(1);
+  // "After page" follows a page id (?after=, or the last page added before a failed batch) until the user
+  // picks a number, so a reload or reorder doesn't move the insertion point.
+  const [afterAnchor, setAfterAnchor] = useState<string | null>(initialAfter);
+  const [afterInput, setAfterInput] = useState(initialAfter ? "" : "1");
   const [addTo, setAddTo] = useState<Set<string>>(new Set());
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const touchedBookmarks = useRef(false);
 
-  // Resolve ?after=<page id> into a page number once the notebook loads.
+  // Leaving the page cancels uploads that are still running.
   useEffect(() => {
-    if (!nb || !initialAfter) return;
-    const idx = nb.pages.findIndex((p) => p.id === initialAfter);
-    if (idx >= 0) setAfterNumber(idx + 1);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [nb?.id]);
-
-  useEffect(() => () => queue.forEach((q) => q.abort?.()), []); // eslint-disable-line react-hooks/exhaustive-deps
+    const running = aborts.current;
+    return () => running.forEach((abort) => abort());
+  }, []);
 
   const pageCount = nb?.pages.length ?? 0;
-  const k = position === "start" ? 0 : position === "end" ? pageCount : Math.max(1, Math.min(pageCount, afterNumber));
+  const anchorIndex = afterAnchor && nb ? nb.pages.findIndex((p) => p.id === afterAnchor) : -1;
+  const anchorMissing = position === "after" && !!afterAnchor && !!nb && anchorIndex < 0;
+  const afterNumber = anchorIndex >= 0 ? anchorIndex + 1 : afterPageNumber(afterInput, pageCount);
+  const k = position === "start" ? 0 : position === "end" ? pageCount : afterNumber;
   const prevPage = k > 0 ? nb?.pages[k - 1] : undefined;
   const nextPage = nb?.pages[k];
+
+  function pickAfterPage(value: string) {
+    setAfterAnchor(null);
+    setAfterInput(value);
+  }
 
   // Bookmarks around the insertion point: pre-check those containing both neighbours.
   const nearby = useMemo(() => {
@@ -73,8 +82,10 @@ export function UploadPage() {
       .filter((x) => x.any);
   }, [nb, prevPage, nextPage]);
 
+  // A checked bookmark that drops out of the list is unchecked, so it can't get pages the user can't see.
   useEffect(() => {
     if (!touchedBookmarks.current) setAddTo(new Set(nearby.filter((x) => x.both).map((x) => x.bookmark.id)));
+    else setAddTo((prev) => new Set(listedBookmarkIds(prev, nearby)));
   }, [nearby]);
 
   function addFiles(files: File[]) {
@@ -85,8 +96,9 @@ export function UploadPage() {
       const handle = uploadPdf(file, (p) =>
         setQueue((q) => q.map((f) => (f.key === key ? { ...f, progress: p, status: p >= 1 ? "processing" : "uploading" } : f))),
       );
+      aborts.current.set(key, handle.abort);
       setQueue((q) => [...q, { key, file, progress: 0, status: "uploading", abort: handle.abort }]);
-      handle.promise.then(
+      handle.promise.finally(() => aborts.current.delete(key)).then(
         (source) =>
           setQueue((q) => q.map((f) => (f.key === key ? { ...f, status: "ready", source, abort: undefined } : f))),
         (err) =>
@@ -102,36 +114,77 @@ export function UploadPage() {
   const newPages = ready.reduce((sum, q) => sum + (q.source?.page_count ?? 0), 0);
 
   async function insertAll() {
-    if (!nb || !ready.length) return;
+    if (!nb || !ready.length || anchorMissing) return;
     setBusy(true);
     setError(null);
+    const added: QueuedFile[] = [];
+    let lastPageId: string | null = null;
     try {
       let detail: NotebookDetail = nb;
       let pos: Parameters<typeof insertSource>[2] =
         position === "after" && prevPage ? { at: "after", afterPageId: prevPage.id } : { at: position === "start" ? "start" : "end" };
+      const bookmarkIds = listedBookmarkIds(addTo, nearby);
       for (const item of ready) {
-        detail = await insertSource(detail, item.source!.id, pos, [...addTo]);
+        detail = await insertSource(detail, item.source!.id, pos, bookmarkIds);
+        // Each insert is committed on its own: take the file off the queue so a retry doesn't add it twice.
+        added.push(item);
+        setQueue((q) => q.filter((f) => f.key !== item.key));
         const inserted = detail.inserted_page_ids ?? [];
-        if (inserted.length) pos = { at: "after", afterPageId: inserted[inserted.length - 1] };
+        if (inserted.length) {
+          lastPageId = inserted[inserted.length - 1];
+          pos = { at: "after", afterPageId: lastPageId };
+        }
       }
       toast(`Added ${plural(newPages, "page")} to “${nb.name}”.`);
       navigate(`/n/${nb.id}`);
     } catch (err) {
+      let message = errorMessage(err);
       if (err instanceof ApiError && err.code === "stale_rev") {
         await queryClient.invalidateQueries({ queryKey: ["notebook", nb.id] });
-        setError("The notebook changed while you were uploading. Check the position and try again.");
-      } else {
-        setError(errorMessage(err));
+        message = "The notebook changed while you were uploading. Check the position and try again.";
       }
+      if (added.length) {
+        // The remaining files continue after the pages already added, keeping the files in order.
+        if (lastPageId) {
+          setPosition("after");
+          setAfterAnchor(lastPageId);
+        }
+        const names = added.map((f) => `“${f.file.name}”`).join(", ");
+        message = `Added ${names}; the remaining files go after those pages. ${message}`;
+      }
+      setError(message);
     } finally {
       setBusy(false);
     }
   }
 
+  if (!nb && loadError) {
+    return (
+      <div className="center-fill">
+        <div className="empty">
+          <h3>{loadError instanceof ApiError && loadError.status === 404 ? "Notebook not found" : "Couldn't load notebook"}</h3>
+          <p>It may have been moved to the Trash.</p>
+          <Link to="/">Go to your library</Link>
+        </div>
+      </div>
+    );
+  }
   if (isLoading || !nb) {
     return (
       <div className="center-fill">
         <div className="spinner lg" />
+      </div>
+    );
+  }
+  if (nb.trashed_at) {
+    // Reachable by Back or an old link; the server would reject the insert after the uploads.
+    return (
+      <div className="center-fill">
+        <div className="empty">
+          <h3>This notebook is in the Trash</h3>
+          <p>Restore it to add pages.</p>
+          <Link to={`/n/${nb.id}`}>Go to the notebook</Link>
+        </div>
       </div>
     );
   }
@@ -266,8 +319,9 @@ export function UploadPage() {
                   type="number"
                   min={1}
                   max={pageCount}
-                  value={afterNumber}
-                  onChange={(e) => setAfterNumber(Number(e.target.value) || 1)}
+                  value={anchorIndex >= 0 ? String(afterNumber) : afterInput}
+                  onChange={(e) => pickAfterPage(e.target.value)}
+                  onBlur={() => !afterAnchor && setAfterInput(String(afterNumber))}
                 />
                 <span className="muted">of {pageCount}</span>
               </label>
@@ -275,11 +329,16 @@ export function UploadPage() {
                 type="range"
                 min={1}
                 max={pageCount}
-                value={Math.min(afterNumber, pageCount)}
-                onChange={(e) => setAfterNumber(Number(e.target.value))}
+                value={afterNumber}
+                onChange={(e) => pickAfterPage(e.target.value)}
                 aria-label="Insert after page"
               />
             </div>
+          )}
+          {anchorMissing && (
+            <p className="form-error" role="alert">
+              The page you chose is no longer in this notebook. Choose where the pages should go.
+            </p>
           )}
           {pageCount > 0 && (
             <div className="insert-preview" aria-label="Insertion point">
@@ -333,7 +392,11 @@ export function UploadPage() {
           <button className="btn" onClick={() => navigate(`/n/${nb.id}`)}>
             Cancel
           </button>
-          <button className="btn btn-primary btn-lg" disabled={!ready.length || pending || busy} onClick={() => void insertAll()}>
+          <button
+            className="btn btn-primary btn-lg"
+            disabled={!ready.length || pending || busy || anchorMissing}
+            onClick={() => void insertAll()}
+          >
             {busy
               ? "Adding…"
               : pending

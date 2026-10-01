@@ -18,18 +18,27 @@ import {
   X,
 } from "lucide-react";
 import { renameNode } from "../../api/actions";
+import { errorMessage, isNotFound, isPageError } from "../../api/client";
 import { useFolder, useMe } from "../../api/queries";
 import type { LibraryNode, PathEntry, SortKey } from "../../api/types";
 import { FolderGlyph } from "../../components/Glyphs";
 import { ContextMenuContent, MenuButton, type MenuEntry } from "../../components/Menu";
 import { plural } from "../../lib/format";
-import { isEditableTarget, useDocumentTitle, useIsCoarse, useIsNarrow } from "../../lib/hooks";
+import {
+  isEditableTarget,
+  useDocumentTitle,
+  useIsCoarse,
+  useIsInstalledApp,
+  useIsNarrow,
+  useLongPressMenu,
+} from "../../lib/hooks";
+import { shortcutKey } from "../../lib/keys";
 import { useFolderDrop } from "../../layout/FolderTree";
 import { useClipboard } from "../../state/clipboard";
 import { isFileDrag } from "../../state/drag";
 import { toastError } from "../../state/toasts";
 import { uploadAsNotebooks } from "../../state/uploads";
-import { GridView, ListView } from "./ItemViews";
+import { focusRenameInput, GridView, ListView } from "./ItemViews";
 import { useNodeActions } from "./nodeActions";
 import { sortNodes } from "./sorting";
 import { useMarquee } from "./useMarquee";
@@ -37,9 +46,11 @@ import { useSelection } from "./useSelection";
 
 function Crumb({ entry, last }: { entry: PathEntry | null; last: boolean }) {
   const drop = useFolderDrop(entry?.id ?? null, entry?.name ?? "Library");
+  // A path can end at a notebook (the Add PDF page): only folders take dropped items and files.
+  const droppable = !entry || entry.kind === "folder";
   const to = entry ? `/f/${entry.id}` : "/";
   return (
-    <li className={`crumb ${drop.over ? "drop-over" : ""}`} {...drop.props}>
+    <li className={`crumb ${droppable && drop.over ? "drop-over" : ""}`} {...(droppable ? drop.props : {})}>
       {last ? (
         <span aria-current="page">{entry ? entry.name : "Library"}</span>
       ) : (
@@ -49,13 +60,14 @@ function Crumb({ entry, last }: { entry: PathEntry | null; last: boolean }) {
   );
 }
 
-export function Breadcrumbs({ path }: { path: PathEntry[] }) {
+/** `linkLast`: the path ends at the folder containing the current page, so every crumb is a link. */
+export function Breadcrumbs({ path, linkLast = false }: { path: PathEntry[]; linkLast?: boolean }) {
   const narrow = useIsNarrow();
   const shown = narrow && path.length > 2 ? path.slice(-2) : path;
   return (
     <nav aria-label="Breadcrumb">
       <ol className="breadcrumbs">
-        <Crumb entry={null} last={path.length === 0} />
+        <Crumb entry={null} last={!linkLast && path.length === 0} />
         {narrow && path.length > 2 && (
           <li className="crumb">
             <ChevronRight className="sep" size={14} />
@@ -66,7 +78,7 @@ export function Breadcrumbs({ path }: { path: PathEntry[] }) {
           <li key={entry.id} className="crumb-wrap">
             <ChevronRight className="sep" size={14} />
             <ol className="breadcrumbs inner">
-              <Crumb entry={entry} last={i === shown.length - 1} />
+              <Crumb entry={entry} last={!linkLast && i === shown.length - 1} />
             </ol>
           </li>
         ))}
@@ -79,16 +91,20 @@ export function ExplorerPage() {
   const { folderId } = useParams();
   const currentFolder = folderId ?? null;
   const { data: me } = useMe();
-  const { data, isLoading, error } = useFolder(currentFolder);
+  const { data, isLoading, error, refetch } = useFolder(currentFolder);
   const navigate = useNavigate();
   const coarse = useIsCoarse();
   const narrow = useIsNarrow();
+  const installed = useIsInstalledApp();
   const clipboard = useClipboard();
   const contentRef = useRef<HTMLDivElement>(null);
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [menuTargets, setMenuTargets] = useState<LibraryNode[] | "background">("background");
-  const [fileDragOver, setFileDragOver] = useState(false);
+  // A desktop file drag over the list: "here" drops into this folder, "item" onto a folder or notebook tile.
+  const [fileDrag, setFileDrag] = useState<"here" | "item" | null>(null);
   const marqueeBase = useRef<Set<string>>(new Set());
+  // The next contextmenu event comes from the Menu key or Shift+F10, not from the pointer.
+  const keyboardMenu = useRef(false);
 
   const savedSort = me?.prefs.sort;
   const sort = useMemo(() => savedSort ?? { key: "name" as SortKey, dir: "asc" as const }, [savedSort]);
@@ -127,9 +143,9 @@ export function ExplorerPage() {
     onClickEmpty: selection.clear,
   });
 
-  const onRenameDone = async (id: string, name: string | null) => {
+  const onRenameDone = async (id: string, name: string | null, refocus: boolean) => {
     setRenamingId(null);
-    contentRef.current?.focus({ preventScroll: true });
+    if (refocus) contentRef.current?.focus({ preventScroll: true });
     const node = items.find((i) => i.id === id);
     if (!name || !node || name === node.name) return;
     try {
@@ -144,9 +160,12 @@ export function ExplorerPage() {
 
   function onKeyDown(e: React.KeyboardEvent) {
     if (isEditableTarget(e.target) || renamingId) return;
+    // Keys already handled by a control in the list (the "…" button), or typed in its portalled menu.
+    if (e.defaultPrevented || !e.currentTarget.contains(e.target as Node)) return;
+    keyboardMenu.current = e.key === "ContextMenu" || (e.shiftKey && e.key === "F10");
     const mod = e.ctrlKey || e.metaKey;
     const single = selectedNodes.length === 1 ? selectedNodes[0] : null;
-    const key = e.key.toLowerCase();
+    const key = shortcutKey(e);
     if (mod && key === "a") {
       e.preventDefault();
       selection.selectAll();
@@ -164,7 +183,7 @@ export function ExplorerPage() {
       void actions.newFolder();
     } else if ((e.key === "Delete" || (e.metaKey && e.key === "Backspace")) && selectedNodes.length) {
       e.preventDefault();
-      void actions.trash(selectedNodes);
+      if (!e.repeat) void actions.trash(selectedNodes);
     } else if (e.key === "F2" && single) {
       e.preventDefault();
       setRenamingId(single.id);
@@ -199,8 +218,14 @@ export function ExplorerPage() {
   }
 
   function onContextMenu(e: React.MouseEvent) {
-    if (isEditableTarget(e.target)) return;
-    const el = (e.target as HTMLElement).closest<HTMLElement>("[data-node-id]");
+    const fromKeyboard = keyboardMenu.current;
+    keyboardMenu.current = false;
+    targetMenuAt(e.target as HTMLElement, fromKeyboard);
+  }
+
+  function targetMenuAt(target: HTMLElement, fromKeyboard: boolean) {
+    if (isEditableTarget(target)) return;
+    const el = target.closest<HTMLElement>("[data-node-id]");
     if (el) {
       const id = el.dataset.nodeId!;
       if (!selection.selected.has(id)) {
@@ -209,11 +234,16 @@ export function ExplorerPage() {
       } else {
         setMenuTargets(selectedNodes);
       }
+    } else if (fromKeyboard && selectedNodes.length) {
+      // The list itself has focus (items are only aria-activedescendant), so open the selection's menu.
+      setMenuTargets(selectedNodes);
     } else {
       selection.clear();
       setMenuTargets("background");
     }
   }
+
+  const longPress = useLongPressMenu((target) => targetMenuAt(target, false));
 
   const menuEntries: MenuEntry[] =
     menuTargets === "background"
@@ -221,19 +251,35 @@ export function ExplorerPage() {
       : actions.itemEntries(menuTargets);
 
   const newEntries: MenuEntry[] = [
-    { label: "Folder", icon: <FolderPlus />, shortcut: "Ctrl+Shift+N", onSelect: () => void actions.newFolder() },
+    // Browser tabs keep Ctrl+Shift+N for a private window; only an installed app window receives it.
+    {
+      label: "Folder",
+      icon: <FolderPlus />,
+      shortcut: installed ? "Ctrl+Shift+N" : undefined,
+      onSelect: () => void actions.newFolder(),
+    },
     { label: "Notebook", icon: <NotebookPen />, onSelect: () => void actions.newNotebook() },
     { label: "Bookmark…", icon: <BookmarkPlus />, onSelect: () => actions.newBookmark() },
   ];
 
-  if (error) {
+  if (isPageError(error, !!data)) {
     return (
       <div className="center-fill">
-        <div className="empty">
-          <h3>Folder not found</h3>
-          <p>It may have been moved to the Trash.</p>
-          <Link to="/">Go to your library</Link>
-        </div>
+        {isNotFound(error) ? (
+          <div className="empty">
+            <h3>Folder not found</h3>
+            <p>It may have been moved to the Trash.</p>
+            <Link to="/">Go to your library</Link>
+          </div>
+        ) : (
+          <div className="empty">
+            <h3>Couldn't load this folder</h3>
+            <p>{errorMessage(error)}</p>
+            <button className="btn" onClick={() => void refetch()}>
+              Try again
+            </button>
+          </div>
+        )}
       </div>
     );
   }
@@ -298,27 +344,39 @@ export function ExplorerPage() {
         </div>
       </div>
 
-      <ContextMenu.Root>
+      <ContextMenu.Root onOpenChange={longPress.onOpenChange}>
         <ContextMenu.Trigger asChild>
           <div
             ref={contentRef}
-            className={`explorer-content ${fileDragOver ? "file-drag" : ""}`}
+            className={`explorer-content ${fileDrag ? "file-drag" : ""}`}
             tabIndex={0}
             aria-activedescendant={selection.focused ? `node-${selection.focused}` : undefined}
             onKeyDown={onKeyDown}
             onContextMenu={onContextMenu}
+            onContextMenuCapture={longPress.onContextMenuCapture}
+            onPointerDownCapture={(e) => {
+              keyboardMenu.current = false;
+              longPress.onPointerDownCapture(e);
+            }}
+            onDragOverCapture={(e) => {
+              if (!isFileDrag(e)) return;
+              // Folder and notebook tiles take the drop themselves (upload into it, add to its end).
+              const el = (e.target as HTMLElement).closest<HTMLElement>("[data-node-id]");
+              const kind = el && items.find((i) => i.id === el.dataset.nodeId)?.kind;
+              setFileDrag(kind === "folder" || kind === "notebook" ? "item" : "here");
+            }}
             onDragOver={(e) => {
               if (isFileDrag(e)) {
                 e.preventDefault();
                 e.dataTransfer.dropEffect = "copy";
-                setFileDragOver(true);
               }
             }}
             onDragLeave={(e) => {
-              if (!e.currentTarget.contains(e.relatedTarget as Node)) setFileDragOver(false);
+              if (!e.currentTarget.contains(e.relatedTarget as Node)) setFileDrag(null);
             }}
+            // Tiles keep their drop from bubbling up here, and no dragleave follows a drop.
+            onDropCapture={() => setFileDrag(null)}
             onDrop={(e) => {
-              setFileDragOver(false);
               if (isFileDrag(e)) {
                 e.preventDefault();
                 void uploadAsNotebooks([...e.dataTransfer.files], currentFolder);
@@ -364,15 +422,16 @@ export function ExplorerPage() {
                 }}
               />
             )}
-            {fileDragOver && (
-              <div className="file-drop-hint">
+            {fileDrag && (
+              // Hidden over a tile; it comes back after a short delay so crossing the gaps doesn't flash it.
+              <div className={`file-drop-hint ${fileDrag === "item" ? "over-item" : ""}`}>
                 <UploadCloud />
                 <span>Drop PDFs to add them to {data?.folder ? `“${data.folder.name}”` : "your library"}</span>
               </div>
             )}
           </div>
         </ContextMenu.Trigger>
-        <ContextMenuContent entries={menuEntries} />
+        <ContextMenuContent entries={menuEntries} onCloseAutoFocus={(e) => focusRenameInput(e, contentRef.current)} />
       </ContextMenu.Root>
 
       {narrow && selectedNodes.length > 0 && (

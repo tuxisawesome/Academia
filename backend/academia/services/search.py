@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
-from ..models import BOOKMARK, FOLDER, NOTEBOOK, Node, Page, SourcePage
+from ..models import BOOKMARK, FOLDER, NOTEBOOK, Bookmark, Node, Page, SourcePage
 from .common import chunks, descendant_ids, owned_folder_or_root
 from .describe import bookmark_members, describe_nodes, page_json
 
@@ -26,27 +26,63 @@ _word_re = re.compile(r"\w+", re.UNICODE)
 _phrase_re = re.compile(r'"([^"]+)"')
 
 
+# Scripts written without spaces between words (Han, Hiragana, Katakana, Thai): each of
+# their characters is indexed as a word of its own, so a word inside a run is found as the
+# phrase of its characters.
+_unspaced_re = re.compile("([\u0e00-\u0e7f\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0003134f])")
+
+
 def normalize(value: str) -> str:
-    """Lowercase without diacritics — the same folding the FTS index applies."""
+    """Lowercase without diacritics, for matching names."""
     decomposed = unicodedata.normalize("NFKD", value or "")
     return "".join(ch for ch in decomposed if not unicodedata.combining(ch)).casefold()
 
 
+def _spaced(value: str) -> str:
+    return _unspaced_re.sub(r" \1 ", value)
+
+
+def index_text(value: str) -> str:
+    """The form in which page text is indexed (query words get the same treatment).
+
+    Compatibility characters are unified (ligatures, full-width letters, superscripts) and
+    unspaced scripts are split into characters; the FTS tokenizer then folds case and Latin
+    diacritics the same way for the text and for the query.
+    """
+    return _spaced(unicodedata.normalize("NFKC", value or ""))
+
+
+def _words(value: str) -> list[str]:
+    """Runs of word characters; combining marks (e.g. Thai vowel signs) stay in their word."""
+    words: list[str] = []
+    word = ""
+    for ch in value:
+        if ch.isalnum() or ch == "_" or unicodedata.category(ch).startswith("M"):
+            word += ch
+        elif word:
+            words.append(word)
+            word = ""
+    if word:
+        words.append(word)
+    return words
+
+
 def parse_query(query: str) -> tuple[list[str], list[list[str]]]:
     """Split a query into loose words and "quoted phrases" (each a list of words)."""
-    q = normalize(query)
-    phrases = [_word_re.findall(p) for p in _phrase_re.findall(q)]
+    q = unicodedata.normalize("NFKC", query or "")
+    phrases = [_words(p) for p in _phrase_re.findall(q)]
     phrases = [p for p in phrases if p]
     rest = _phrase_re.sub(" ", q)
-    words = list(dict.fromkeys(_word_re.findall(rest)))
+    words = list(dict.fromkeys(_words(rest)))
     if len(words) > 1:
-        # Stray single letters are dropped, but numbers ("lecture 7") narrow the search.
-        words = [w for w in words if len(w) > 1 or w.isdigit()] or words
+        # Stray single letters are dropped, but numbers ("lecture 7") and characters of
+        # unspaced scripts narrow the search.
+        words = [w for w in words if len(w) > 1 or w.isdigit() or _unspaced_re.match(w)] or words
     return words, phrases
 
 
 def _quote(term: str) -> str:
-    return '"' + term.replace('"', '""') + '"'
+    return '"' + _spaced(term).replace('"', '""') + '"'
 
 
 def _word_clause(word: str) -> str:
@@ -59,6 +95,7 @@ def matching_pages(db: Session, user_id: str, query: str) -> set[tuple[str, int]
     words, phrases = parse_query(query)
     if not words and not phrases:
         return set()
+    # Quoted terms go through the index's own tokenizer, which folds case and Latin diacritics.
     expr = " AND ".join([_word_clause(w) for w in words] + [_quote(" ".join(p)) for p in phrases])
     rows = db.execute(
         text(
@@ -144,7 +181,17 @@ def search(db: Session, user_id: str, query: str, folder_id: str | None = None) 
                 if page.notebook_id in nb_ids and key in matched:
                     number = (page.position or 0) + 1
                     hits[page.notebook_id].append({**page_json(page, sp), "number": number, "open_page": number})
-        members = bookmark_members(db, [b.id for b in bookmarks])
+        # Bookmarks of a notebook in the Trash show nothing: their pages are only in the Trash.
+        live_bm: set[str] = set()
+        for part in chunks([b.id for b in bookmarks]):
+            live_bm.update(
+                db.scalars(
+                    select(Bookmark.node_id)
+                    .join(Node, Node.id == Bookmark.notebook_id)
+                    .where(Bookmark.node_id.in_(part), Node.trashed_at.is_(None))
+                )
+            )
+        members = bookmark_members(db, list(live_bm))
         for bm in bookmarks:
             # open_page: the page's place within the bookmark (what the bookmark reader shows).
             for k, (page, sp) in enumerate(members.get(bm.id, []), start=1):

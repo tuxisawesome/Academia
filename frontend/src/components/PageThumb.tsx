@@ -38,7 +38,9 @@ interface Props {
  * (their URLs never change), and the page's extra rotation is applied with CSS.
  */
 export const PageThumb = memo(function PageThumb({ page, boxWidth, boxHeight, className, eager, alt = "" }: Props) {
-  const [failed, setFailed] = useState(false);
+  // The URL that failed to load. Only that image is left out: a thumb reused for another page
+  // (a tile's new cover, a moving preview) tries the new page's image.
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
   const aspect = displayedAspect(page);
   let dw = boxWidth;
   let dh = boxWidth / aspect;
@@ -51,17 +53,19 @@ export const PageThumb = memo(function PageThumb({ page, boxWidth, boxHeight, cl
   const imgH = quarter ? dw : dh;
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const src = thumbUrl(page.source_id, page.index, snapWidth(imgW * dpr));
+  // Forget the failure once the URL changes, so coming back to that page tries it again.
+  if (failedSrc !== null && failedSrc !== src) setFailedSrc(null);
   return (
     <div className={`thumb-box ${className ?? ""}`} style={{ width: boxWidth, height: boxHeight }}>
       <div className="thumb-paper" style={{ width: dw, height: dh }}>
-        {!failed && (
+        {failedSrc !== src && (
           <img
             src={src}
             alt={alt}
             draggable={false}
             loading={eager ? "eager" : "lazy"}
             decoding="async"
-            onError={() => setFailed(true)}
+            onError={() => setFailedSrc(src)}
             style={{
               width: imgW,
               height: imgH,

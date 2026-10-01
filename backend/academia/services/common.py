@@ -27,17 +27,36 @@ FOLDER_COLORS = (
 
 CHUNK = 500
 
+# Invisible characters that are part of how words and emoji are written: the zero-width
+# non-joiner and joiner, and the tag characters of subdivision flags such as England's.
+KEPT_FORMAT_CHARS = frozenset("\u200c\u200d" + "".join(chr(c) for c in range(0xE0020, 0xE0080)))
+
 
 def chunks(items: Sequence[Any], size: int = CHUNK) -> Iterable[Sequence[Any]]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
 
 
+def unwanted_in_name(ch: str) -> bool:
+    """Control characters and invisible formatting such as bidi overrides.
+
+    Unassigned code points are allowed: they include emoji newer than Python's Unicode tables.
+    Noncharacters (U+FDD0..U+FDEF and U+xxFFFE/U+xxFFFF) are never assigned and are dropped.
+    """
+    category = unicodedata.category(ch)
+    if category == "Cf":
+        return ch not in KEPT_FORMAT_CHARS
+    if category == "Cn":
+        cp = ord(ch)
+        return 0xFDD0 <= cp <= 0xFDEF or cp & 0xFFFE == 0xFFFE
+    return category in ("Cc", "Cs", "Co")
+
+
 def clean_name(name: str) -> str:
     """Validate a user-supplied item name."""
-    cleaned = "".join(ch for ch in unicodedata.normalize("NFC", name or "") if unicodedata.category(ch)[0] != "C")
+    cleaned = "".join(ch for ch in unicodedata.normalize("NFC", name or "") if not unwanted_in_name(ch))
     cleaned = " ".join(cleaned.split())
-    if not cleaned:
+    if all(ch.isspace() or ch in KEPT_FORMAT_CHARS for ch in cleaned):
         raise BadRequest("Please enter a name.", code="invalid_name")
     if len(cleaned) > 255:
         raise BadRequest("Names can be at most 255 characters long.", code="invalid_name")
@@ -89,6 +108,24 @@ def ancestors(db: Session, node_id: str) -> list[dict[str, Any]]:
         {"id": node_id},
     ).all()
     return [{"id": r.id, "name": r.name, "kind": r.kind, "color": r.color} for r in rows]
+
+
+def ancestor_ids(db: Session, node_id: str) -> set[str]:
+    """``node_id`` and every folder above it, however deeply nested (unlike ``ancestors``)."""
+    rows = db.execute(
+        text(
+            """
+            WITH RECURSIVE anc(id, parent_id) AS (
+                SELECT id, parent_id FROM nodes WHERE id = :id
+                UNION
+                SELECT n.id, n.parent_id FROM nodes n JOIN anc ON n.id = anc.parent_id
+            )
+            SELECT id FROM anc
+            """
+        ),
+        {"id": node_id},
+    ).scalars()
+    return set(rows)
 
 
 def descendant_ids(db: Session, root_ids: Sequence[str], live_only: bool = False) -> list[str]:
@@ -145,6 +182,23 @@ def live_children_count(db: Session, folder_ids: Sequence[str]) -> dict[str, int
                 f"""SELECT parent_id, count(*) AS c FROM nodes
                     WHERE parent_id IN ({", ".join(f":p{i}" for i in range(len(part)))})
                       AND trashed_at IS NULL GROUP BY parent_id"""
+            ),
+            {f"p{i}": v for i, v in enumerate(part)},
+        ).all()
+        counts.update({r.parent_id: r.c for r in rows})
+    return counts
+
+
+def trashed_children_count(db: Session, folder_ids: Sequence[str]) -> dict[str, int]:
+    """For trashed folders: the children trashed along with each, i.e. those a restore brings back."""
+    counts: dict[str, int] = {}
+    for part in chunks(list(folder_ids)):
+        rows = db.execute(
+            text(
+                f"""SELECT child.parent_id, count(*) AS c FROM nodes child
+                    JOIN nodes parent ON parent.id = child.parent_id
+                    WHERE child.parent_id IN ({", ".join(f":p{i}" for i in range(len(part)))})
+                      AND child.trash_root_id = parent.trash_root_id GROUP BY child.parent_id"""
             ),
             {f"p{i}": v for i, v in enumerate(part)},
         ).all()

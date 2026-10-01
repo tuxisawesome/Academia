@@ -3,6 +3,7 @@ import { logout } from "../../api/actions";
 import { useMe } from "../../api/queries";
 import { Wordmark } from "../../components/Glyphs";
 import { useDocumentTitle } from "../../lib/hooks";
+import { toastError } from "../../state/toasts";
 import { PasswordForm } from "./PasswordForm";
 
 export function ChangePasswordPage() {
@@ -27,8 +28,12 @@ export function ChangePasswordPage() {
           className="btn btn-ghost btn-block"
           style={{ marginTop: 8 }}
           onClick={async () => {
-            await logout();
-            navigate("/login", { replace: true });
+            try {
+              await logout();
+              navigate("/login", { replace: true });
+            } catch (err) {
+              toastError(err);
+            }
           }}
         >
           Sign out

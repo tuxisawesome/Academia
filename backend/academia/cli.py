@@ -34,6 +34,11 @@ def _fail(message: str) -> None:
     raise typer.Exit(1)
 
 
+def _printable(text: str) -> str:
+    """``text`` with non-printable characters escaped, so stored values can't drive the terminal."""
+    return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode() for ch in text)
+
+
 @app.command()
 def migrate() -> None:
     """Upgrade the database schema to the latest version."""
@@ -128,11 +133,13 @@ def reset_password(
             password = generated = generate_password()
         user.password_hash = hash_password(password)
         user.must_change_password = True
-        user.disabled_at = None
         revoke_user_sessions(db, user.id)
+        disabled = user.disabled_at is not None
     typer.echo(f"Password for '{username}' reset; they must choose a new one at next sign-in.")
     if generated:
         typer.echo(f"Temporary password: {generated}")
+    if disabled:
+        typer.echo(f"The account is disabled. To let them sign in again, run: academia enable {username}")
 
 
 @app.command("list-users")
@@ -145,7 +152,8 @@ def list_users() -> None:
         users = svc_list(db)
     for u in users:
         flags = ",".join(f for f, on in (("admin", u["is_admin"]), ("disabled", u["disabled"])) if on)
-        typer.echo(f"{u['username']:<24} {u['display_name']:<28} {flags:<16} {u['storage_bytes'] / 1e6:10.1f} MB")
+        name = _printable(u["display_name"])
+        typer.echo(f"{_printable(u['username']):<24} {name:<28} {flags:<16} {u['storage_bytes'] / 1e6:10.1f} MB")
 
 
 @app.command("set-admin")
@@ -197,8 +205,9 @@ def maintenance() -> None:
 @app.command()
 def backup(
     dest: Annotated[Path | None, typer.Option(help="Directory for the backup (default: <data>/backups).")] = None,
-    keep: Annotated[int, typer.Option(help="How many backups with this label to keep (0 = all).")] = 14,
-    label: Annotated[str, typer.Option(help="Backup file label.")] = "nightly",
+    keep: Annotated[int, typer.Option(help="How many backups with this label to keep (0 = all).")] = 0,
+    # Not "nightly": with the timer's label, an extra backup would prune the oldest nightly one.
+    label: Annotated[str, typer.Option(help="Backup file label.")] = "manual",
 ) -> None:
     """Make a consistent copy of the database while the app is running."""
     _init()

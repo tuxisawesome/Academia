@@ -30,6 +30,8 @@ import {
   copyNodes,
   createFolder,
   createNotebook,
+  liveNodeIds,
+  moveBack,
   moveNodes,
   pinFolders,
   renameNode,
@@ -41,10 +43,12 @@ import {
   unpinFolders,
   updatePrefs,
 } from "../../api/actions";
+import { ApiError } from "../../api/client";
 import { useMe, usePins } from "../../api/queries";
 import type { FolderColor, LibraryNode, Prefs, SortKey } from "../../api/types";
 import type { MenuEntry } from "../../components/Menu";
 import { plural } from "../../lib/format";
+import { groupByParent } from "../../lib/parents";
 import { useClipboard } from "../../state/clipboard";
 import { confirmDialog, promptDialog } from "../../state/dialogs";
 import { toast, toastError } from "../../state/toasts";
@@ -60,13 +64,30 @@ export function uniqueName(base: string, existing: string[]): string {
   }
 }
 
+/** Warns when bookmarks elsewhere point into notebooks among `targets`; false if the user cancels. */
+export async function confirmTrash(targets: LibraryNode[]): Promise<boolean> {
+  if (!targets.some((t) => t.kind !== "bookmark")) return true;
+  const { bookmarks_elsewhere } = await trashCheck(targets.map((t) => t.id));
+  if (bookmarks_elsewhere === 0) return true;
+  return confirmDialog({
+    title: "Move to Trash?",
+    message: `${plural(bookmarks_elsewhere, "bookmark")} elsewhere in your library ${
+      bookmarks_elsewhere === 1 ? "points" : "point"
+    } into ${targets.length === 1 ? "this" : "these"} notebook${
+      targets.length === 1 ? "" : "s"
+    }. ${bookmarks_elsewhere === 1 ? "It" : "They"} will be unavailable while it's in the Trash, and deleted if the Trash is emptied.`,
+    confirmLabel: "Move to Trash",
+    danger: true,
+  });
+}
+
 interface Options {
   /** Folder that "New…" and "Paste" apply to (null = Library root). */
   folderId: string | null;
   /** Names in the current folder, to pick unique default names. */
   siblingNames?: string[];
-  /** Start inline renaming (explorer); falls back to a prompt dialog. */
-  startRename?: (id: string) => void;
+  /** Start inline renaming (explorer); falls back to a prompt dialog when absent or it returns false. */
+  startRename?: (id: string) => boolean | void;
   /** Called after items were trashed/moved away (e.g. to clear selection). */
   onRemoved?: () => void;
 }
@@ -84,6 +105,7 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
   const [choosingNotebook, setChoosingNotebook] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const uploadTarget = useRef<string | null>(null);
+  const trashing = useRef(new Set<string>());
 
   const open = (node: LibraryNode) => {
     if (node.kind === "folder") navigate(`/f/${node.id}`);
@@ -99,10 +121,7 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
   };
 
   const rename = async (node: LibraryNode) => {
-    if (startRename) {
-      startRename(node.id);
-      return;
-    }
+    if (startRename && startRename(node.id) !== false) return;
     const name = await promptDialog({ title: "Rename", label: "Name", initial: node.name, confirmLabel: "Rename" });
     if (!name || name === node.name) return;
     try {
@@ -113,25 +132,12 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
   };
 
   const trash = async (targets: LibraryNode[]) => {
-    if (!targets.length) return;
+    // A held Delete key or a double-click must not trash the same items twice.
+    if (!targets.length || targets.some((t) => trashing.current.has(t.id))) return;
     const ids = targets.map((t) => t.id);
+    for (const id of ids) trashing.current.add(id);
     try {
-      if (targets.some((t) => t.kind !== "bookmark")) {
-        const { bookmarks_elsewhere } = await trashCheck(ids);
-        if (bookmarks_elsewhere > 0) {
-          const ok = await confirmDialog({
-            title: "Move to Trash?",
-            message: `${plural(bookmarks_elsewhere, "bookmark")} elsewhere in your library ${
-              bookmarks_elsewhere === 1 ? "points" : "point"
-            } into ${targets.length === 1 ? "this" : "these"} notebook${
-              targets.length === 1 ? "" : "s"
-            }. ${bookmarks_elsewhere === 1 ? "It" : "They"} will be unavailable while it's in the Trash, and deleted if the Trash is emptied.`,
-            confirmLabel: "Move to Trash",
-            danger: true,
-          });
-          if (!ok) return;
-        }
-      }
+      if (!(await confirmTrash(targets))) return;
       await trashNodes(ids);
       onRemoved?.();
       toast(
@@ -140,6 +146,8 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
       );
     } catch (err) {
       toastError(err);
+    } finally {
+      for (const id of ids) trashing.current.delete(id);
     }
   };
 
@@ -156,14 +164,31 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
   const paste = async (target: string | null = folderId) => {
     const { mode, ids } = useClipboard.getState();
     if (!mode || !ids.length) return;
+    const run = (list: string[]) => (mode === "cut" ? moveNodes(list, target) : copyNodes(list, target));
+    let pasted = ids;
     try {
+      try {
+        await run(ids);
+      } catch (err) {
+        // Items trashed or deleted since they were cut or copied fail the whole paste: drop them and paste the rest.
+        if (!(err instanceof ApiError && err.status === 404)) throw err;
+        pasted = await liveNodeIds(ids);
+        if (pasted.length === ids.length) throw err;
+        if (!pasted.length) {
+          useClipboard.getState().clear();
+          toast("The items on the clipboard are in the Trash or were deleted.");
+          return;
+        }
+        useClipboard.getState().set(mode, pasted);
+        await run(pasted);
+      }
+      const gone = ids.length - pasted.length;
+      const note = gone ? ` ${plural(gone, "item")} in the Trash or deleted ${gone === 1 ? "was" : "were"} skipped.` : "";
       if (mode === "cut") {
-        await moveNodes(ids, target);
         useClipboard.getState().clear();
-        toast(`Moved ${plural(ids.length, "item")}.`);
+        toast(`Moved ${plural(pasted.length, "item")}.${note}`);
       } else {
-        await copyNodes(ids, target);
-        toast(`Pasted ${plural(ids.length, "item")}.`);
+        toast(`Pasted ${plural(pasted.length, "item")}.${note}`);
       }
     } catch (err) {
       toastError(err);
@@ -172,10 +197,10 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
 
   const duplicate = async (targets: LibraryNode[]) => {
     try {
-      await copyNodes(
-        targets.map((t) => t.id),
-        targets[0]?.parent_id ?? null,
-      );
+      // Each copy goes next to its original; search results can come from several folders.
+      for (const [parent, ids] of groupByParent(targets.map((t) => [t.id, t.parent_id] as const))) {
+        await copyNodes(ids, parent);
+      }
       toast(targets.length === 1 ? `Duplicated “${targets[0].name}”.` : `Duplicated ${plural(targets.length, "item")}.`);
     } catch (err) {
       toastError(err);
@@ -244,8 +269,7 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
   };
 
   const setView = (view: Prefs["view"]) => updatePrefs({ view }).catch(toastError);
-  const setSort = (sort: Partial<Prefs["sort"]>) =>
-    updatePrefs({ sort: { ...(me?.prefs.sort ?? { key: "name", dir: "asc" }), ...sort } }).catch(toastError);
+  const setSort = (sort: Partial<Prefs["sort"]>) => updatePrefs({ sort }).catch(toastError);
 
   function itemEntries(targets: LibraryNode[]): MenuEntry[] {
     if (!targets.length) return [];
@@ -388,12 +412,12 @@ export function useNodeActions({ folderId, siblingNames = [], startRename, onRem
         targets={moveTargets}
         onClose={() => setMoveTargets(null)}
         onMove={async (dest) => {
-          const ids = (moveTargets ?? []).map((t) => t.id);
-          const from = moveTargets?.[0]?.parent_id ?? null;
+          const origins = new Map((moveTargets ?? []).map((t) => [t.id, t.parent_id]));
+          const ids = [...origins.keys()];
           await moveNodes(ids, dest);
           onRemoved?.();
           toast(`Moved ${plural(ids.length, "item")}.`, {
-            action: { label: "Undo", onClick: () => void moveNodes(ids, from).catch(toastError) },
+            action: { label: "Undo", onClick: () => void moveBack(origins).catch(toastError) },
           });
         }}
       />

@@ -11,12 +11,13 @@ from urllib.parse import urlsplit
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from sqlalchemy import text
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from .api.deps import set_session_cookie
 from .config import build_info, get_settings
 from .db import get_engine, init_engine, read_session
 from .errors import AppError
@@ -30,6 +31,14 @@ from .workers import pool
 log = logging.getLogger("academia")
 
 SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+# Largest request body of an API call. FastAPI reads and parses a JSON body before it checks
+# who is signed in, so without a limit anyone could make the server hold any amount of data.
+# The largest real body, a notebook's whole page order, takes about 40 bytes per page. PDF
+# uploads stream to disk instead and have their own limit (max_upload_mb).
+MAX_BODY_BYTES = 2 * 1024 * 1024
+UPLOAD_PATH = "/api/sources"
+BODY_TOO_LARGE = "This request is too large."
 
 CSP = "; ".join(
     [
@@ -49,8 +58,33 @@ CSP = "; ".join(
 )
 
 
+def _limit_body(receive: Receive) -> Receive:
+    """``receive`` that fails with 413 once the body passes MAX_BODY_BYTES.
+
+    This also covers chunked bodies, which have no Content-Length to check up front.
+    """
+    received = 0
+
+    async def limited() -> Message:
+        nonlocal received
+        message = await receive()
+        if message["type"] == "http.request":
+            received += len(message.get("body", b""))
+            if received > MAX_BODY_BYTES:
+                # FastAPI passes an HTTPException raised while it reads the body on to the handler.
+                raise StarletteHTTPException(413, BODY_TOO_LARGE)
+        return message
+
+    return limited
+
+
 class GuardMiddleware:
-    """Rejects cross-origin state-changing API requests (CSRF) and adds common headers."""
+    """Rejects cross-origin state-changing API requests (CSRF) and oversized request bodies,
+    and adds common headers.
+
+    It also sends the session cookie again, with a fresh lifetime, when the request renewed
+    the session (see ``deps._load_session``).
+    """
 
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -58,6 +92,10 @@ class GuardMiddleware:
 
     @staticmethod
     def _origin_ok(headers: Headers) -> bool:
+        # Browsers say whether a request comes from a page of the same origin. Unlike comparing
+        # Origin with Host, this also works behind a proxy that rewrites the Host header.
+        if headers.get("sec-fetch-site") == "same-origin":
+            return True
         origin = headers.get("origin") or headers.get("referer")
         if not origin:
             return False
@@ -80,6 +118,12 @@ class GuardMiddleware:
             )
             await response(scope, receive, send)
             return
+        if unsafe and path != UPLOAD_PATH:
+            length = Headers(scope=scope).get("content-length", "")
+            if length.isdigit() and int(length) > MAX_BODY_BYTES:
+                await _error(413, "too_large", BODY_TOO_LARGE)(scope, receive, send)
+                return
+            receive = _limit_body(receive)
 
         async def send_wrapper(message: Message) -> None:
             if message["type"] == "http.response.start":
@@ -92,6 +136,11 @@ class GuardMiddleware:
                 headers.setdefault("Content-Security-Policy", CSP)
                 if path.startswith("/api/"):
                     headers.setdefault("Cache-Control", "no-store")
+                renewed = scope.get("state", {}).get("renew_session")
+                if renewed and message["status"] != 401:
+                    cookie = Response()
+                    set_session_cookie(cookie, renewed, secure=scope["scheme"] == "https")
+                    headers.append("set-cookie", cookie.headers["set-cookie"])
             await send(message)
 
         await self.app(scope, receive, send_wrapper)
@@ -115,7 +164,7 @@ def _register_errors(app: FastAPI) -> None:
 
     @app.exception_handler(StarletteHTTPException)
     async def http_error(_request: Request, exc: StarletteHTTPException) -> JSONResponse:
-        code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "http_error")
+        code = {404: "not_found", 405: "method_not_allowed", 413: "too_large"}.get(exc.status_code, "http_error")
         return _error(exc.status_code, code, str(exc.detail))
 
 
@@ -129,8 +178,13 @@ def _mount_frontend(app: FastAPI) -> None:
         root = dist.resolve()
         index = root / "index.html"
         if full_path:
-            candidate = (root / full_path).resolve()
-            if candidate.is_relative_to(root) and candidate.is_file():
+            try:
+                candidate = (root / full_path).resolve()
+                found = candidate.is_relative_to(root) and candidate.is_file()
+            except (OSError, ValueError):
+                # A name no file can have, e.g. with a NUL byte or longer than the system allows.
+                found = False
+            if found:
                 if full_path.startswith("assets/"):
                     cache = "public, max-age=31536000, immutable"
                 elif full_path.startswith(("pdfjs/", "fonts/", "icons/")):

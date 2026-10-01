@@ -13,6 +13,13 @@ import "./styles/settings.css";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { reloadForNewBuild } from "./lib/staleBuild";
+import { guardFileDrops } from "./state/drag";
+
+guardFileDrops();
+// A chunk of an older build failed to load (the server was updated): reload to get the new one.
+// If the reload is suppressed, the route's error page offers it instead.
+window.addEventListener("vite:preloadError", () => void reloadForNewBuild());
 
 createRoot(document.getElementById("root")!).render(
   <StrictMode>

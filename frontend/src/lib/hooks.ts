@@ -14,6 +14,9 @@ export function useMediaQuery(query: string): boolean {
 
 export const useIsNarrow = () => useMediaQuery("(max-width: 760px)");
 export const useIsCoarse = () => useMediaQuery("(pointer: coarse)");
+/** Running as an installed app window, where browser shortcuts such as Ctrl+Shift+N reach the page. */
+export const useIsInstalledApp = () =>
+  useMediaQuery("(display-mode: standalone), (display-mode: window-controls-overlay)");
 
 export function useElementSize<T extends HTMLElement>(ref: RefObject<T | null>): { width: number; height: number } {
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -55,4 +58,26 @@ export function isEditableTarget(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   if (!el) return false;
   return el.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName);
+}
+
+/**
+ * Radix's ContextMenu also opens on a touch or pen long-press by itself, and some platforms (iOS)
+ * fire no contextmenu event then. Put `onPointerDownCapture`/`onContextMenuCapture` on the trigger
+ * and `onOpenChange` on the Root: a menu that opens without a contextmenu event calls `onTarget`
+ * with the pressed element, so it gets the targets a right-click there would.
+ */
+export function useLongPressMenu(onTarget: (target: HTMLElement) => void) {
+  const pressed = useRef<HTMLElement | null>(null);
+  return {
+    onPointerDownCapture: (e: React.PointerEvent) => {
+      pressed.current = e.pointerType === "mouse" ? null : (e.target as HTMLElement);
+    },
+    onContextMenuCapture: () => {
+      pressed.current = null;
+    },
+    onOpenChange: (open: boolean) => {
+      if (open && pressed.current) onTarget(pressed.current);
+      pressed.current = null;
+    },
+  };
 }

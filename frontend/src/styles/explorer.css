@@ -130,6 +130,11 @@
   -webkit-user-select: none;
 }
 
+/* Rows scrolled into view (keyboard navigation) stop below the sticky column header. */
+.explorer-content:has(> .list-view) {
+  scroll-padding-top: 40px;
+}
+
 .explorer-content:focus-visible {
   box-shadow: none;
 }
@@ -152,6 +157,12 @@
   font-size: 17px;
   pointer-events: none;
   z-index: 5;
+  transition: opacity 0.12s 0.15s;
+}
+
+.file-drop-hint.over-item {
+  opacity: 0;
+  transition: opacity 0.08s;
 }
 
 .file-drop-hint svg {
@@ -541,6 +552,10 @@
 .picker-row.selected {
   background: var(--accent-soft);
   font-weight: 500;
+}
+
+.picker-row:focus-visible {
+  outline-offset: -2px;
 }
 
 .picker-row.disabled {

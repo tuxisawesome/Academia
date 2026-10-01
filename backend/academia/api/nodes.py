@@ -28,7 +28,7 @@ class NodePatch(BaseModel):
 
 
 class IdsBody(BaseModel):
-    ids: list[str] = Field(min_length=1, max_length=5000)
+    ids: list[str] = Field(min_length=1, max_length=100_000)
 
 
 class TargetBody(IdsBody):

@@ -1,4 +1,4 @@
-import { ApiError } from "./client";
+import { ApiError, checkSession } from "./client";
 import type { UploadedSource } from "./types";
 import { checkServerVersion, reportNetworkError } from "../state/connection";
 
@@ -27,6 +27,7 @@ export function uploadPdf(file: File, onProgress?: (fraction: number) => void): 
         resolve(xhr.response as UploadedSource);
       } else {
         const err = (xhr.response && xhr.response.error) || {};
+        checkSession(xhr.status, err.code);
         const message =
           err.message ||
           (xhr.status === 413 ? "This file is larger than the server allows." : `Upload failed (${xhr.status}).`);

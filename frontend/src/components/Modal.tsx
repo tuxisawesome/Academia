@@ -15,6 +15,11 @@ interface ModalProps {
   onOpenAutoFocus?: (e: Event) => void;
 }
 
+/** Toasts, the connection overlay and the update banner sit above dialogs; using them shouldn't dismiss one. */
+function isAppChrome(target: EventTarget | null): boolean {
+  return target instanceof Element && target.closest(".toaster, .overlay-block, .update-banner") !== null;
+}
+
 export function Modal({
   open,
   onOpenChange,
@@ -32,7 +37,7 @@ export function Modal({
         <Dialog.Overlay className="dialog-overlay" />
         <Dialog.Content
           className={`modal ${size === "normal" ? "" : size}`}
-          onPointerDownOutside={(e) => modalLock && e.preventDefault()}
+          onPointerDownOutside={(e) => (modalLock || isAppChrome(e.detail.originalEvent.target)) && e.preventDefault()}
           onEscapeKeyDown={(e) => modalLock && e.preventDefault()}
           onOpenAutoFocus={onOpenAutoFocus}
         >

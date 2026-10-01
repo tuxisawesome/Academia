@@ -120,7 +120,7 @@ def test_pdf_cache_is_content_addressed(client, tmp_path: Path, data_dir: Path):
     client.patch(f"/api/nodes/{nb['id']}", json={"name": "Renamed"})
     etag3 = client.get(f"/api/notebooks/{nb['id']}/pdf").headers["etag"]
     assert etag3 != etag1
-    assert len(list((data_dir / "cache" / "pdf").glob("*.pdf"))) == 2
+    assert len(list((data_dir / "cache" / "pdf").rglob("*.pdf"))) == 2
 
 
 def test_thumbnails(client, tmp_path: Path):

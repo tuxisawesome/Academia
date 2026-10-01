@@ -4,6 +4,11 @@ Every operation computes the new ordered list of live page ids and then renumber
 positions in two passes so the UNIQUE(notebook_id, position) index is never violated
 mid-update. Each change bumps the notebook's ``rev``; clients send the rev they last saw
 (``base_rev``) and receive 409 if someone else changed the notebook in the meantime.
+
+Deleted pages that can still be restored keep their place among the live pages: their
+``deleted_position`` is their index in the *full* order (live and restorable pages
+together), and every operation carries them along. Undo then puts pages back between
+their original neighbours, even after later deletes, inserts or reorders.
 """
 
 from __future__ import annotations
@@ -65,6 +70,40 @@ def apply_order(db: Session, notebook_id: str, ordered_ids: Sequence[str]) -> No
             [{"id": pid, "position": i} for i, pid in enumerate(ordered_ids)],
         )
     db.expire_all()
+
+
+def full_order(db: Session, notebook_id: str) -> tuple[list[str], set[str]]:
+    """All live and restorable deleted pages in order, and the set of the deleted ones."""
+    live = live_page_ids(db, notebook_id)
+    rows = db.execute(
+        select(Page.id, Page.deleted_position)
+        .where(Page.notebook_id == notebook_id, Page.deleted_at.is_not(None), Page.deleted_batch.is_not(None))
+        .order_by(Page.deleted_at)
+    ).all()
+    end = len(live) + len(rows)
+    slots = sorted(((end if pos is None else pos, pid) for pid, pos in rows), key=lambda s: s[0])
+    order: list[str] = []
+    i = 0
+    for slot, pid in slots:
+        # Live pages fill the slots between deleted ones (there are gaps once maintenance
+        # has purged old deleted pages).
+        while len(order) < slot and i < len(live):
+            order.append(live[i])
+            i += 1
+        order.append(pid)
+    order.extend(live[i:])
+    return order, {pid for pid, _ in rows}
+
+
+def store_order(db: Session, notebook_id: str, order: Sequence[str], deleted: set[str]) -> list[str]:
+    """Save a full order (see ``full_order``). Returns the live page ids in order."""
+    db.flush()
+    slots = [{"id": pid, "deleted_position": i} for i, pid in enumerate(order) if pid in deleted]
+    if slots:
+        db.execute(update(Page), slots)
+    live = [pid for pid in order if pid not in deleted]
+    apply_order(db, notebook_id, live)
+    return live
 
 
 def _bump(db: Session, node: Node, nb: Notebook, page_count: int, bookmark_ids: Sequence[str] = ()) -> None:
@@ -180,15 +219,15 @@ def insert_source(
     node, nb = require_notebook(db, user_id, notebook_id)
     check_rev(nb, base_rev)
     src = owned_source(db, user_id, source_id)
-    ids = live_page_ids(db, node.id)
+    full, deleted = full_order(db, node.id)
     if at == "start":
         k = 0
     elif at == "end":
-        k = len(ids)
+        k = len(full)
     elif at == "after":
-        if after_page_id not in ids:
+        if after_page_id not in full or after_page_id in deleted:
             raise BadRequest("The page to insert after no longer exists.", code="invalid_position")
-        k = ids.index(after_page_id) + 1
+        k = full.index(after_page_id) + 1
     else:
         raise BadRequest("Unknown insert position.", code="invalid_position")
 
@@ -208,8 +247,7 @@ def insert_source(
     db.add_all(new_pages)
     db.flush()
     new_ids = [p.id for p in new_pages]
-    order = ids[:k] + new_ids + ids[k:]
-    apply_order(db, node.id, order)
+    order = store_order(db, node.id, full[:k] + new_ids + full[k:], deleted)
 
     touched: list[str] = []
     for bm_id in dict.fromkeys(add_to_bookmarks):
@@ -235,10 +273,23 @@ def insert_source(
 def reorder(db: Session, user_id: str, notebook_id: str, base_rev: int | None, page_ids: Sequence[str]) -> None:
     node, nb = require_notebook(db, user_id, notebook_id)
     check_rev(nb, base_rev)
-    ids = live_page_ids(db, node.id)
+    full, deleted = full_order(db, node.id)
+    ids = [pid for pid in full if pid not in deleted]
     if len(page_ids) != len(ids) or set(page_ids) != set(ids):
         raise Conflict("The page list changed while you were editing. Please try again.", code="stale_rev", rev=nb.rev)
-    apply_order(db, node.id, list(page_ids))
+    # Deleted pages move along with the live page they followed.
+    following: dict[str | None, list[str]] = {}
+    prev: str | None = None
+    for pid in full:
+        if pid in deleted:
+            following.setdefault(prev, []).append(pid)
+        else:
+            prev = pid
+    order = list(following.get(None, []))
+    for pid in page_ids:
+        order.append(pid)
+        order.extend(following.get(pid, []))
+    store_order(db, node.id, order, deleted)
     node, nb = require_notebook(db, user_id, notebook_id)
     _bump(db, node, nb, len(ids))
 
@@ -272,20 +323,16 @@ def delete_pages(db: Session, user_id: str, notebook_id: str, base_rev: int | No
     """Soft-delete pages. Returns a batch id that ``undelete`` accepts."""
     node, nb = require_notebook(db, user_id, notebook_id)
     check_rev(nb, base_rev)
-    ids = live_page_ids(db, node.id)
-    wanted = _validate_subset(page_ids, ids)
+    full, deleted = full_order(db, node.id)
+    wanted = _validate_subset(page_ids, [pid for pid in full if pid not in deleted])
     batch = new_id()
     now = utcnow()
     for part in chunks(wanted):
         for page in db.scalars(select(Page).where(Page.id.in_(part))):
             page.deleted_at = now
             page.deleted_batch = batch
-            page.deleted_position = page.position
             page.position = None
-    db.flush()
-    gone = set(wanted)
-    remaining = [pid for pid in ids if pid not in gone]
-    apply_order(db, node.id, remaining)
+    remaining = store_order(db, node.id, full, deleted | set(wanted))
     node, nb = require_notebook(db, user_id, notebook_id)
     _bump(db, node, nb, len(remaining), _bookmarks_touching(db, wanted))
     return batch
@@ -295,21 +342,17 @@ def undelete(db: Session, user_id: str, notebook_id: str, batch: str) -> None:
     node, nb = require_notebook(db, user_id, notebook_id)
     pages = list(
         db.scalars(
-            select(Page)
-            .where(Page.notebook_id == node.id, Page.deleted_batch == batch, Page.deleted_at.is_not(None))
-            .order_by(Page.deleted_position)
+            select(Page).where(Page.notebook_id == node.id, Page.deleted_batch == batch, Page.deleted_at.is_not(None))
         )
     )
     if not pages:
         raise NotFound("Those pages can no longer be restored.")
-    order = live_page_ids(db, node.id)
+    full, deleted = full_order(db, node.id)
     for page in pages:
-        pos = page.deleted_position if page.deleted_position is not None else len(order)
-        order.insert(min(pos, len(order)), page.id)
+        deleted.discard(page.id)
         page.deleted_at = None
         page.deleted_batch = None
         page.deleted_position = None
-    db.flush()
-    apply_order(db, node.id, order)
+    order = store_order(db, node.id, full, deleted)
     node, nb = require_notebook(db, user_id, notebook_id)
     _bump(db, node, nb, len(order), _bookmarks_touching(db, [p.id for p in pages]))

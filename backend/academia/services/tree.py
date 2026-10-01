@@ -23,6 +23,7 @@ from ..models import (
 )
 from .common import (
     FOLDER_COLORS,
+    ancestor_ids,
     ancestors,
     clean_name,
     descendant_ids,
@@ -125,7 +126,7 @@ def _top_level(db: Session, user_id: str, ids: list[str]) -> list[Node]:
 
 def move_nodes(db: Session, user_id: str, ids: list[str], target_id: str | None) -> int:
     target = owned_folder_or_root(db, user_id, target_id)
-    target_path = {a["id"] for a in ancestors(db, target.id)} if target else set()
+    target_path = ancestor_ids(db, target.id) if target else set()
     moved = 0
     now = utcnow()
     for node in _top_level(db, user_id, ids):
@@ -151,7 +152,7 @@ def copy_nodes(db: Session, user_id: str, ids: list[str], target_id: str | None)
     at the original notebook.
     """
     target = owned_folder_or_root(db, user_id, target_id)
-    target_path = {a["id"] for a in ancestors(db, target.id)} if target else set()
+    target_path = ancestor_ids(db, target.id) if target else set()
     tops = _top_level(db, user_id, ids)
     for node in tops:
         if node.kind == FOLDER and node.id in target_path:

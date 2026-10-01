@@ -3,7 +3,7 @@ import { RefreshCw, WifiOff } from "lucide-react";
 import { invalidateLibrary, queryClient } from "../api/queries";
 import { useConnection } from "../state/connection";
 
-async function serverReachable(): Promise<"ok" | "down" | "offline"> {
+export async function serverReachable(): Promise<"ok" | "down" | "offline"> {
   try {
     const res = await fetch("/api/health", { cache: "no-store", credentials: "same-origin" });
     if (res.ok) return "ok";

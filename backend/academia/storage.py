@@ -41,12 +41,31 @@ def pdf_cache_dir() -> Path:
     return data_dir() / "cache" / "pdf"
 
 
-def pdf_cache_path(digest: str) -> Path:
-    return pdf_cache_dir() / f"{digest}.pdf"
+def user_pdf_cache_dir(owner_id: str) -> Path:
+    return pdf_cache_dir() / owner_id
+
+
+def pdf_cache_path(owner_id: str, digest: str) -> Path:
+    return user_pdf_cache_dir(owner_id) / f"{digest}.pdf"
+
+
+def exports_dir() -> Path:
+    return data_dir() / "exports"
 
 
 def export_path(job_id: str) -> Path:
-    return data_dir() / "exports" / f"{job_id}.zip"
+    return exports_dir() / f"{job_id}.zip"
+
+
+def remove_export_files(job_id: str) -> None:
+    final = export_path(job_id)
+    final.unlink(missing_ok=True)
+    final.with_suffix(".zip.part").unlink(missing_ok=True)
+
+
+def deleted_source_marker(source_id: str) -> Path:
+    """Marks the file of a source whose owner was deleted; its modification time is when."""
+    return source_path(source_id).with_suffix(".deleted")
 
 
 def remove_source_files(source_id: str) -> None:

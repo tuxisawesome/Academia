@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import shutil
 import sqlite3
 import time
 from datetime import datetime, timedelta
@@ -12,9 +13,9 @@ from typing import Any
 from sqlalchemy import delete, exists, select, update
 
 from ..config import get_settings
-from ..db import write_session
-from ..models import Job, Page, Session, Source, utcnow
-from ..storage import data_dir, pdf_cache_dir, remove_source_files, tmp_dir
+from ..db import read_session, write_session
+from ..models import Job, Page, Session, Source, User, utcnow
+from ..storage import data_dir, exports_dir, pdf_cache_dir, remove_source_files, tmp_dir
 from .common import chunks
 from .trash import mark_orphans, purge_expired
 
@@ -64,9 +65,31 @@ def delete_orphaned_sources(cutoff: datetime) -> int:
     return len(ids)
 
 
-def trim_pdf_cache(max_bytes: int) -> int:
+def remove_deleted_users_files(cutoff: datetime) -> int:
+    """Uploads of deleted users, once they have been kept as long as other unused uploads.
+
+    Their rows went with the user, so a marker next to each file says since when (see
+    ``users.remove_files``). The files stay if a restored backup brought the upload back.
+    """
+    removed = 0
+    for marker in (data_dir() / "sources").glob("*/*.deleted"):
+        try:
+            if marker.stat().st_mtime >= cutoff.timestamp():
+                continue
+        except FileNotFoundError:
+            continue
+        with read_session() as db:
+            restored = db.get(Source, marker.stem) is not None
+        if not restored:
+            remove_source_files(marker.stem)
+            removed += 1
+        marker.unlink(missing_ok=True)
+    return removed
+
+
+def trim_pdf_cache(max_bytes: int, keep: Path | None = None) -> int:
     files = []
-    for path in pdf_cache_dir().glob("*.pdf"):
+    for path in pdf_cache_dir().rglob("*.pdf"):
         try:
             st = path.stat()
         except FileNotFoundError:
@@ -77,13 +100,18 @@ def trim_pdf_cache(max_bytes: int) -> int:
     for _, size, path in sorted(files):
         if total <= max_bytes:
             break
+        if path == keep:
+            continue
         path.unlink(missing_ok=True)
         total -= size
         removed += 1
     # Leftovers from interrupted builds.
-    for part in pdf_cache_dir().glob("*.part"):
-        if part.stat().st_mtime < time.time() - 3600:
-            part.unlink(missing_ok=True)
+    for part in pdf_cache_dir().rglob("*.part"):
+        try:
+            if part.stat().st_mtime < time.time() - 3600:
+                part.unlink(missing_ok=True)
+        except FileNotFoundError:  # a build finished and renamed it meanwhile
+            continue
     return removed
 
 
@@ -101,6 +129,36 @@ def expire_exports(now: datetime) -> int:
                 Path(job.result_path).unlink(missing_ok=True)
             db.delete(job)
         return len(jobs)
+
+
+def remove_orphaned_files() -> int:
+    """Files nothing refers to any more: export archives whose job is gone (deleted users,
+    interrupted exports), cached PDFs of deleted users, and leftovers of older versions."""
+    # List before reading the ids: a file that exists already has its row committed.
+    exports = list(exports_dir().glob("*")) if exports_dir().is_dir() else []
+    cached = list(pdf_cache_dir().iterdir()) if pdf_cache_dir().is_dir() else []
+    with read_session() as db:
+        job_ids = set(db.scalars(select(Job.id)))
+        user_ids = set(db.scalars(select(User.id)))
+    removed = 0
+    for path in exports:
+        if path.is_file() and path.name.split(".", 1)[0] not in job_ids:
+            path.unlink(missing_ok=True)
+            removed += 1
+    for path in cached:
+        if path.is_dir():
+            if path.name not in user_ids:
+                shutil.rmtree(path, ignore_errors=True)
+                removed += 1
+        else:  # from before the cache was kept per user
+            path.unlink(missing_ok=True)
+            removed += 1
+    # Model files mirrored for the handwriting recognition that has been removed.
+    models = data_dir() / "models"
+    if models.is_dir():
+        shutil.rmtree(models, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def expire_sessions(now: datetime) -> int:
@@ -130,8 +188,10 @@ def run_maintenance() -> dict[str, Any]:
     stats["pages_purged"] = purge_deleted_pages(now - timedelta(days=s.deleted_pages_retention_days))
     stats["unused_sources_marked"] = mark_unused_sources(now - timedelta(days=1))
     stats["sources_deleted"] = delete_orphaned_sources(now - timedelta(days=s.orphan_source_grace_days))
+    stats["deleted_users_files"] = remove_deleted_users_files(now - timedelta(days=s.orphan_source_grace_days))
     stats["cache_files_removed"] = trim_pdf_cache(s.pdf_cache_max_mb * 1024 * 1024)
     stats["exports_expired"] = expire_exports(now)
+    stats["orphaned_files_removed"] = remove_orphaned_files()
     stats["sessions_expired"] = expire_sessions(now)
     stats["tmp_files_removed"] = clean_tmp()
     log.info("Maintenance: %s", stats)

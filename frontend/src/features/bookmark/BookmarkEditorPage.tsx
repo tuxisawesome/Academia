@@ -1,78 +1,114 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type SetStateAction } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router";
 import { ArrowLeft, X, ZoomIn, ZoomOut } from "lucide-react";
 import { createBookmark, renameNode, setBookmarkPages } from "../../api/actions";
-import { errorMessage } from "../../api/client";
-import { useBookmark, useNotebook } from "../../api/queries";
-import { formatRanges, parseRanges, rangesLabel, toRanges, type Range } from "../../lib/ranges";
+import { ApiError, errorMessage } from "../../api/client";
+import { queryClient, useBookmark, useNotebook } from "../../api/queries";
+import type { BookmarkDetail } from "../../api/types";
+import { formatRanges, rangesLabel, toRanges, type Range } from "../../lib/ranges";
 import { plural } from "../../lib/format";
 import { useDocumentTitle } from "../../lib/hooks";
 import { toast } from "../../state/toasts";
 import { PageGrid, useGridZoom, ZOOM_STEPS, type PageGridHandle } from "../notebook/PageGrid";
 import { PagePreview } from "../notebook/PagePreview";
+import { rebaseSelection, selectionForRangeText } from "./selection";
+
+/** The bookmark as the user's edits started from it. */
+interface Base {
+  rev: number;
+  name: string;
+  pageIds: string[];
+}
 
 export function BookmarkEditorPage() {
   const { id } = useParams();
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const isNew = !id;
-  const { data: bookmark, isLoading: bmLoading } = useBookmark(id);
+  // Both are refetched when the editor opens, and editing starts from that data: a cached copy
+  // can predate pages added to the bookmark (or a rename) since, and saving it would quietly
+  // undo those changes. A new bookmark starts empty, so cached pages are fine for it.
+  const bmQuery = useBookmark(id, { staleTime: 0 });
+  const bookmark = bmQuery.data;
   const notebookId = isNew ? params.get("notebook") : bookmark?.notebook.id;
   const parentId = isNew ? params.get("parent") || null : (bookmark?.parent_id ?? null);
-  const { data: nb, isLoading: nbLoading, error: nbError } = useNotebook(notebookId);
+  const nbQuery = useNotebook(notebookId, { staleTime: 0 });
+  const nb = nbQuery.data;
+  const loading = isNew
+    ? nbQuery.isLoading
+    : !bmQuery.isFetchedAfterMount || (!!notebookId && !nbQuery.isFetchedAfterMount);
+  const unavailable = !nb || !!nbQuery.error || (!isNew && !bookmark);
+  const [ready, setReady] = useState(false);
   const [name, setName] = useState("New bookmark");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [rangeText, setRangeText] = useState("");
+  // Text typed into the page-range field; null while the field just shows the selection.
+  const [rangeDraft, setRangeDraft] = useState<string | null>(null);
   const [rangeError, setRangeError] = useState<string | null>(null);
-  const [editingRange, setEditingRange] = useState(false);
   const [saving, setSaving] = useState(false);
   const [preview, setPreview] = useState<number | null>(null);
   const [zoom, setZoom] = useGridZoom("picker", 1);
   const gridRef = useRef<PageGridHandle>(null);
-  const initialized = useRef(false);
+  // Its rev is sent with the save, so changes made elsewhere meanwhile are reported, not overwritten.
+  const base = useRef<Base | null>(null);
+  // The selection from before the user started typing in the page-range field.
+  const beforeTyping = useRef<Set<string>>(new Set());
   useDocumentTitle(isNew ? "New bookmark" : `Edit ${bookmark?.name ?? "bookmark"}`);
 
   const pages = useMemo(() => nb?.pages ?? [], [nb?.pages]);
   const numberOf = useMemo(() => new Map(pages.map((p, i) => [p.id, i + 1])), [pages]);
+  // Selected pages that are (still) in the notebook, in notebook order.
+  const picked = useMemo(() => pages.filter((p) => selected.has(p.id)).map((p) => p.id), [pages, selected]);
 
   useEffect(() => {
-    if (initialized.current || !nb) return;
-    if (!isNew && !bookmark) return;
-    initialized.current = true;
+    if (ready || loading || unavailable) return;
+    setReady(true);
     if (bookmark) {
+      base.current = { rev: bookmark.rev, name: bookmark.name, pageIds: bookmark.page_ids };
       setName(bookmark.name);
       setSelected(new Set(bookmark.page_ids.filter((pid) => numberOf.has(pid))));
       const first = bookmark.page_ids.find((pid) => numberOf.has(pid));
       if (first) setTimeout(() => gridRef.current?.scrollToIndex((numberOf.get(first) ?? 1) - 1), 50);
     }
-  }, [nb, bookmark, isNew, numberOf]);
+  }, [ready, loading, unavailable, bookmark, numberOf]);
 
   const ranges: Range[] = useMemo(
     () => toRanges([...selected].map((pid) => numberOf.get(pid)).filter((n): n is number => !!n)),
     [selected, numberOf],
   );
 
-  // Keep the range text in sync with the grid unless the user is typing in it.
-  useEffect(() => {
-    if (!editingRange) {
-      setRangeText(formatRanges(ranges));
-      setRangeError(null);
-    }
-  }, [ranges, editingRange]);
-
   function applyRangeText(text: string) {
-    setRangeText(text);
-    const result = parseRanges(text, pages.length);
+    if (rangeDraft === null) beforeTyping.current = selected;
+    const result = selectionForRangeText(text, pages, beforeTyping.current);
+    setRangeDraft(text);
     setRangeError(result.error);
-    if (!result.error) setSelected(new Set(result.numbers.map((n) => pages[n - 1].id)));
+    setSelected(result.selected);
+  }
+
+  /** Changes the selection from outside the page-range field, replacing any text typed there. */
+  function pick(next: SetStateAction<Set<string>>) {
+    setRangeDraft(null);
+    setRangeError(null);
+    setSelected(next);
   }
 
   function removeRange([a, b]: Range) {
-    setSelected((prev) => {
+    pick((prev) => {
       const next = new Set(prev);
       for (let n = a; n <= b; n++) next.delete(pages[n - 1].id);
       return next;
     });
+  }
+
+  /** After a conflict (the bookmark and notebook have been reloaded), keeps the user's edits on top. */
+  function rebase() {
+    // The page-range field shows the reloaded selection rather than text typed against the old one.
+    setRangeDraft(null);
+    const fresh = bookmark && queryClient.getQueryData<BookmarkDetail>(["bookmark", bookmark.id]);
+    const from = base.current;
+    if (!fresh || !from || fresh.rev === from.rev) return;
+    base.current = { rev: fresh.rev, name: fresh.name, pageIds: fresh.page_ids };
+    setSelected((edited) => rebaseSelection(from.pageIds, edited, fresh.page_ids));
+    setName((current) => (current.trim() === from.name ? fresh.name : current));
   }
 
   const back = () => {
@@ -82,41 +118,65 @@ export function BookmarkEditorPage() {
 
   async function save() {
     if (!nb) return;
-    const ids = pages.filter((p) => selected.has(p.id)).map((p) => p.id);
     const cleanName = name.trim();
     if (!cleanName) {
       toast("Please give the bookmark a name.", { kind: "error" });
       return;
     }
+    if (rangeError) {
+      toast(rangeError, { kind: "error" });
+      return;
+    }
+    if (!picked.length) {
+      toast("Please select at least one page.", { kind: "error" });
+      return;
+    }
     setSaving(true);
     try {
       if (isNew) {
-        const node = await createBookmark(parentId, cleanName, nb.id, ids);
+        const node = await createBookmark(parentId, cleanName, nb.id, picked);
         toast(`Bookmark “${node.name}” saved.`, {
           action: { label: "Read", onClick: () => navigate(`/read/b/${node.id}`) },
         });
         navigate(parentId ? `/f/${parentId}` : "/", { replace: true });
-      } else if (bookmark) {
-        await setBookmarkPages(bookmark.id, ids);
-        if (cleanName !== bookmark.name) await renameNode(bookmark.id, cleanName);
+      } else if (bookmark && base.current) {
+        const saved = await setBookmarkPages(bookmark.id, picked, base.current.rev);
+        base.current = { ...base.current, rev: saved.rev, pageIds: saved.page_ids };
+        // Only a name changed here is saved, so a rename made elsewhere meanwhile is kept.
+        if (cleanName !== base.current.name) await renameNode(bookmark.id, cleanName);
         toast(`Bookmark “${cleanName}” saved.`);
         back();
       }
     } catch (err) {
+      if (err instanceof ApiError && err.status === 409) rebase();
       toast(errorMessage(err), { kind: "error" });
     } finally {
       setSaving(false);
     }
   }
 
-  if (bmLoading || nbLoading) {
+  if (nb?.trashed_at && !loading) {
     return (
       <div className="center-fill">
-        <div className="spinner lg" />
+        <div className="empty">
+          <h3>Notebook in Trash</h3>
+          <p>
+            “{nb.name}” is in the Trash. Restore it to {isNew ? "bookmark its pages" : "edit this bookmark"}.
+          </p>
+          <Link to={`/n/${nb.id}`}>Open the notebook</Link>
+        </div>
       </div>
     );
   }
-  if (!nb || nbError || (!isNew && !bookmark)) {
+
+  if (!ready || !nb) {
+    if (loading || !unavailable) {
+      return (
+        <div className="center-fill">
+          <div className="spinner lg" />
+        </div>
+      );
+    }
     return (
       <div className="center-fill">
         <div className="empty">
@@ -144,7 +204,11 @@ export function BookmarkEditorPage() {
           <button className="btn" onClick={back}>
             Cancel
           </button>
-          <button className="btn btn-primary" onClick={() => void save()} disabled={saving || !name.trim()}>
+          <button
+            className="btn btn-primary"
+            onClick={() => void save()}
+            disabled={saving || !name.trim() || !!rangeError || !picked.length}
+          >
             {saving ? "Saving…" : "Save bookmark"}
           </button>
         </div>
@@ -168,10 +232,10 @@ export function BookmarkEditorPage() {
             id="bm-ranges"
             className="input tabular"
             placeholder="e.g. 3-7, 10, 12-15"
-            value={rangeText}
+            value={rangeDraft ?? formatRanges(ranges)}
             aria-invalid={!!rangeError}
-            onFocus={() => setEditingRange(true)}
-            onBlur={() => setEditingRange(false)}
+            // Valid text is tidied up when leaving the field; invalid text stays, with its error.
+            onBlur={() => !rangeError && setRangeDraft(null)}
             onChange={(e) => applyRangeText(e.target.value)}
           />
           <span className={rangeError ? "form-error" : "field-hint"} style={{ margin: 0 }}>
@@ -182,7 +246,7 @@ export function BookmarkEditorPage() {
 
       <div className="bm-editor-bar">
         <div className="chips">
-          <strong className="tabular">{plural(selected.size, "page")}</strong>
+          <strong className="tabular">{plural(picked.length, "page")}</strong>
           {ranges.length === 0 && <span className="faint">{rangesLabel(ranges)}</span>}
           {ranges.map((r) => (
             <span key={`${r[0]}-${r[1]}`} className="chip tabular">
@@ -201,15 +265,15 @@ export function BookmarkEditorPage() {
           ))}
         </div>
         <div className="bm-bar-actions">
-          <button className="btn btn-sm btn-ghost" onClick={() => setSelected(new Set(pages.map((p) => p.id)))}>
+          <button className="btn btn-sm btn-ghost" onClick={() => pick(new Set(pages.map((p) => p.id)))}>
             All
           </button>
-          <button className="btn btn-sm btn-ghost" onClick={() => setSelected(new Set())}>
+          <button className="btn btn-sm btn-ghost" onClick={() => pick(new Set())}>
             None
           </button>
           <button
             className="btn btn-sm btn-ghost"
-            onClick={() => setSelected(new Set(pages.filter((p) => !selected.has(p.id)).map((p) => p.id)))}
+            onClick={() => pick(new Set(pages.filter((p) => !selected.has(p.id)).map((p) => p.id)))}
           >
             Invert
           </button>
@@ -233,7 +297,7 @@ export function BookmarkEditorPage() {
           pages={pages}
           mode="pick"
           selected={selected}
-          onSelectedChange={setSelected}
+          onSelectedChange={pick}
           tileWidth={ZOOM_STEPS[zoom]}
           onPreview={setPreview}
           ariaLabel={`Pages of ${nb.name}`}
@@ -248,7 +312,7 @@ export function BookmarkEditorPage() {
           labelFor={(i) => `Page ${i + 1} of ${pages.length}`}
           selected={selected}
           onToggle={(pid) =>
-            setSelected((prev) => {
+            pick((prev) => {
               const next = new Set(prev);
               if (next.has(pid)) next.delete(pid);
               else next.add(pid);
