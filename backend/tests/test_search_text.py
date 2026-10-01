@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -15,10 +17,11 @@ from academia import config
 from academia.db import init_engine, read_session, write_session
 from academia.migrations import alembic_config, current_and_head, upgrade_head
 from academia.models import Source
+from academia.services import sources as sources_service
 from academia.services import textindex
-from academia.services.textindex import index_source, sources_needing_text
+from academia.services.textindex import index_source, sources_needing_text, text_indexer
 from academia.services.users import create_user
-from conftest import page_texts, upload
+from conftest import make_text_pdf, page_texts, upload
 
 
 def winansi_pdf(path: Path, texts: list[str]) -> Path:
@@ -43,6 +46,7 @@ def contents(client, q: str) -> list[str]:  # noqa: ANN001
 
 def text_layer_notebook(client, tmp_path: Path, monkeypatch, name: str, texts: list[str]) -> dict:  # noqa: ANN001
     """A notebook whose pages' text layers read ``texts`` (extraction is stubbed: any script)."""
+    text_indexer.stop()  # the real extraction must not get there first
     src = upload(client, winansi_pdf(tmp_path / f"{name}.pdf", [f"{name} {i}" for i in range(len(texts))]))
     with monkeypatch.context() as m:
         stub = SimpleNamespace(run=lambda _fn, _path, chunk, timeout: {i: texts[i] for i in chunk})
@@ -122,6 +126,57 @@ def test_bookmark_of_trashed_notebook_not_in_contents(client, tmp_path: Path, mo
     assert contents(client, "carnot") == []
     client.post("/api/trash/restore", json={"ids": [nb["id"]]})
     assert sorted(contents(client, "carnot")) == ["Mark", "Thermo"]
+
+
+# ---- an upload that was unused when the index was rebuilt gets its text when used again ----
+
+
+def eventually(check: Callable[[], bool], timeout: float = 30) -> bool:
+    deadline = time.monotonic() + timeout
+    while not check():
+        if time.monotonic() > deadline:
+            return False
+        time.sleep(0.1)
+    return True
+
+
+def test_upload_used_again_is_indexed(client, tmp_path: Path):
+    text_indexer.stop()  # as if the index was rebuilt (migration 0003) after these uploads
+    linear = make_text_pdf(tmp_path / "linear.pdf", ["eigenvalue spectrum"])
+    thermo = make_text_pdf(tmp_path / "thermo.pdf", ["entropy production"])
+    ids = []
+    for path in (linear, thermo):
+        src = upload(client, path)
+        nb = client.post("/api/notebooks", json={"name": "Old", "source_id": src["id"]}).json()
+        client.post("/api/nodes/trash", json={"ids": [nb["id"]]})
+        ids.append(src["id"])
+    client.post("/api/trash/empty")
+    assert sources_needing_text() == []  # unused uploads are skipped by the startup backfill
+    text_indexer.start(backfill=True)
+
+    # Uploaded again, or still open on an upload page: either way it is used again.
+    again = upload(client, linear)
+    assert again["id"] == ids[0]
+    client.post("/api/notebooks", json={"name": "Linear", "source_id": again["id"]})
+    client.post("/api/notebooks", json={"name": "Thermo", "source_id": ids[1]})
+
+    def indexed() -> bool:
+        return contents(client, "eigenvalue") == ["Linear"] and contents(client, "entropy") == ["Thermo"]
+
+    assert eventually(indexed)
+
+
+def test_text_is_indexed_even_if_the_pages_cannot_be_measured_again(client, tmp_path: Path, monkeypatch):
+    text_indexer.stop()  # the test does the indexer's work itself
+    src = upload(client, make_text_pdf(tmp_path / "linear.pdf", ["eigenvalue spectrum"]))
+    client.post("/api/notebooks", json={"name": "Linear", "source_id": src["id"]})
+
+    def busy(_source_id: str) -> None:
+        raise TimeoutError  # e.g. every PDF worker is busy with long exports
+
+    monkeypatch.setattr(sources_service, "remeasure", busy)
+    assert index_source(src["id"]) == 1
+    assert contents(client, "eigenvalue") == ["Linear"]
 
 
 # ---- databases migrated by the earlier (OCR) revision 0002 are repaired --------------

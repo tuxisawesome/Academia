@@ -65,19 +65,22 @@ fi
 STEP_NO=0
 STEP_TOTAL=0
 
-say() { printf '%s\n' "$*"; }
-info() { printf '%s\n' "${C_DIM}$*${C_RESET}"; }
-warn() { printf '%s\n' "${C_YELLOW}Warning:${C_RESET} $*" >&2; }
+# Output never stops the script: the terminal can be gone (a dropped SSH connection) while an
+# update finishes its switch-over.
+say() { printf '%s\n' "$*" || true; }
+info() { printf '%s\n' "${C_DIM}$*${C_RESET}" || true; }
+warn() { printf '%s\n' "${C_YELLOW}Warning:${C_RESET} $*" >&2 || true; }
 die() {
-  printf '%s\n' "${C_RED}Error:${C_RESET} $*" >&2
+  printf '%s\n' "${C_RED}Error:${C_RESET} $*" >&2 || true
+  if [[ -n $ON_ERROR_CLEANUP ]] && ((BASH_SUBSHELL == 0)); then $ON_ERROR_CLEANUP || true; fi
   exit 1
 }
 step() {
   STEP_NO=$((STEP_NO + 1))
-  printf '\n%s\n' "${C_BLUE}${C_BOLD}==> [${STEP_NO}/${STEP_TOTAL}] $*${C_RESET}"
+  printf '\n%s\n' "${C_BLUE}${C_BOLD}==> [${STEP_NO}/${STEP_TOTAL}] $*${C_RESET}" || true
   log "== $*"
 }
-ok() { printf '%s\n' "    ${C_GREEN}✓${C_RESET} $*"; }
+ok() { printf '%s\n' "    ${C_GREEN}✓${C_RESET} $*" || true; }
 log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG_FILE" 2>/dev/null || true; }
 
 # Runs a command with its output going to the log file; shows the tail if it fails.
@@ -90,20 +93,20 @@ run() {
 }
 
 show_failure() { # show_failure <command>
-  printf '%s\n' "${C_RED}Command failed:${C_RESET} $1" >&2
-  printf '%s\n' "${C_DIM}Last lines of $LOG_FILE:${C_RESET}" >&2
+  printf '%s\n' "${C_RED}Command failed:${C_RESET} $1" >&2 || true
+  printf '%s\n' "${C_DIM}Last lines of $LOG_FILE:${C_RESET}" >&2 || true
   tail -n 25 "$LOG_FILE" >&2 || true
 }
 
-ON_ERROR_CLEANUP="" # optional command that on_error runs first (e.g. to put a moved-aside release back)
+ON_ERROR_CLEANUP="" # optional command that on_error and die run first (e.g. to put a moved-aside release back)
 
 on_error() {
   local code=$? line=${1:-?}
   # Only report once, from the top-level shell (not from command substitutions).
   ((BASH_SUBSHELL == 0)) || exit "$code"
   if [[ -n $ON_ERROR_CLEANUP ]]; then $ON_ERROR_CLEANUP || true; fi
-  printf '\n%s\n' "${C_RED}${C_BOLD}Academia setup failed${C_RESET} (line $line, exit code $code)." >&2
-  printf '%s\n' "Details are in $LOG_FILE. Fix the problem and run the same command again — it is safe to re-run." >&2
+  printf '\n%s\n' "${C_RED}${C_BOLD}Academia setup failed${C_RESET} (line $line, exit code $code)." >&2 || true
+  printf '%s\n' "Details are in $LOG_FILE. Fix the problem and run the same command again — it is safe to re-run." >&2 || true
   exit "$code"
 }
 
@@ -896,6 +899,22 @@ is_ipv4() {
   [[ $1 =~ ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$ ]]
 }
 
+is_ipv6() { # as Caddy reads it (Go's net/netip), without a zone
+  local addr=$1 hex='[0-9A-Fa-f]{1,4}' head=() tail=()
+  if [[ $addr == *.* ]]; then # the last two groups written as an IPv4 address
+    is_ipv4 "${addr##*:}" || return 1
+    addr=${addr%:*}:0:0
+  fi
+  if [[ $addr == *::* ]]; then # "::" stands for one or more groups of zeros
+    [[ $addr =~ ^(($hex:)*$hex)?::(($hex:)*$hex)?$ ]] || return 1
+    IFS=: read -ra head <<<"${addr%%::*}"
+    IFS=: read -ra tail <<<"${addr#*::}"
+    ((${#head[@]} + ${#tail[@]} < 8))
+  else
+    [[ $addr =~ ^($hex:){7}$hex$ ]]
+  fi
+}
+
 # Top-level domains are letters or punycode (xn--…). With a self-signed certificate, a host name
 # or an IPv4 address also works.
 valid_domain() {
@@ -917,13 +936,29 @@ saved_email() { # ACME_EMAIL from install.conf; older installers saved any answe
   printf '%s' "$email"
 }
 
-valid_proxies() { # IP addresses or CIDR ranges, or Caddy's private_ranges
-  local range ranges
+valid_proxies() { # IP addresses or CIDR ranges as Caddy reads them, or its private_ranges
+  local range ranges addr bits
   read -ra ranges <<<"$1"
   ((${#ranges[@]})) || return 1
   for range in "${ranges[@]}"; do
-    [[ $range == private_ranges || $range =~ ^[0-9A-Fa-f.:]+(/[0-9]{1,3})?$ ]] || return 1
+    [[ $range == private_ranges ]] && continue
+    addr=${range%/*} bits=${range#"$addr"}
+    if is_ipv4 "$addr"; then
+      [[ -z $bits || $bits =~ ^/(3[0-2]|[12]?[0-9])$ ]] || return 1
+    else
+      is_ipv6 "$addr" && [[ -z $bits || $bits =~ ^/(12[0-8]|1[01][0-9]|[1-9]?[0-9])$ ]] || return 1
+    fi
   done
+}
+
+saved_proxies() { # TRUSTED_PROXIES from install.conf; older installers saved ranges Caddy rejects
+  local proxies
+  proxies=$(conf_get TRUSTED_PROXIES "$DEFAULT_TRUSTED_PROXIES")
+  if ! valid_proxies "$proxies"; then
+    warn "Ignoring the saved trusted proxies '$proxies': they are not IP addresses or ranges. Using $DEFAULT_TRUSTED_PROXIES (set TRUSTED_PROXIES in $CONF_FILE to change it)."
+    proxies=$DEFAULT_TRUSTED_PROXIES
+  fi
+  printf '%s' "$proxies"
 }
 
 questions() {
@@ -936,7 +971,7 @@ questions() {
     [[ -z $DOMAIN ]] && DOMAIN=$(conf_get DOMAIN)
     [[ -z $TLS_MODE ]] && TLS_MODE=$(conf_get TLS_MODE auto)
     [[ -z $HTTP_PORT ]] && HTTP_PORT=$(conf_get HTTP_PORT 8080)
-    [[ -z $TRUSTED_PROXIES ]] && TRUSTED_PROXIES=$(conf_get TRUSTED_PROXIES "$DEFAULT_TRUSTED_PROXIES")
+    [[ -z $TRUSTED_PROXIES ]] && TRUSTED_PROXIES=$(saved_proxies)
     [[ $ARG_EMAIL_SET -eq 0 ]] && ACME_EMAIL=$(saved_email)
     [[ -z $REPO_URL ]] && REPO_URL=$(conf_get REPO_URL "$DEFAULT_REPO")
     [[ -z $BRANCH ]] && BRANCH=$(conf_get BRANCH "$DEFAULT_BRANCH")

@@ -187,9 +187,10 @@ function afterOwnEdits(id: string, rev: number): number {
 /**
  * Runs a notebook edit once earlier edits of the same notebook are done. `run` sends the edit
  * with the rev it is given: `baseRev` (the rev the user's view showed; null = unchecked) moved
- * past the edits this client has made since, so only changes made elsewhere conflict. If the
- * edit fails, reloads the notebook (it may have been shown optimistically) and rethrows; on a
- * stale-revision conflict the reload finishes first.
+ * past the edits this client has made since, so only changes made elsewhere conflict. The
+ * result is shown once no later edit of the notebook is waiting. If the edit fails, reloads the
+ * notebook (it may have been shown optimistically) and rethrows; on a stale-revision conflict
+ * the reload finishes first.
  */
 function notebookEdit(
   id: string,
@@ -200,8 +201,10 @@ function notebookEdit(
     .catch(() => undefined)
     .then(async () => {
       const rev = baseRev === null ? null : afterOwnEdits(id, baseRev);
-      // An edit that sends no rev (undo) is taken to start from the rev this client last saw.
-      const from = rev ?? queryClient.getQueryData<NotebookDetail>(["notebook", id])?.rev;
+      // An edit that sends no rev (undo) is taken to start from the rev this client last saw,
+      // which includes its own edits not shown yet.
+      const shown = queryClient.getQueryData<NotebookDetail>(["notebook", id])?.rev;
+      const from = rev ?? (shown === undefined ? undefined : afterOwnEdits(id, shown));
       try {
         const detail = await run(rev);
         // One step up means nothing else changed the notebook in between.
@@ -209,9 +212,13 @@ function notebookEdit(
           if (!ownEdits.has(id)) ownEdits.set(id, new Map());
           ownEdits.get(id)!.set(from, detail.rev);
         }
+        // A later edit is waiting: this result lacks it, and showing it would undo a drag already
+        // shown (until that edit is saved) and have the next drag made from the old order.
+        if (pendingEdits.get(id) !== edit) return detail;
         return storeNotebook(detail);
       } catch (err) {
-        const reload = queryClient.invalidateQueries({ queryKey: ["notebook", id] });
+        // The library too: the edits this one waited for were saved without their results shown.
+        const reload = invalidateLibrary();
         if (err instanceof ApiError && err.status === 409) await reload;
         throw err;
       }
@@ -246,6 +253,8 @@ export function insertSource(
 }
 
 export function reorderPages(nb: NotebookDetail, pageIds: string[]) {
+  // A reload already on its way would bring back the order from before this one.
+  void queryClient.cancelQueries({ queryKey: ["notebook", nb.id] });
   queryClient.setQueryData<NotebookDetail>(["notebook", nb.id], (old) =>
     old ? { ...old, pages: pageIds.map((id) => old.pages.find((p) => p.id === id)!).filter(Boolean) } : old,
   );

@@ -44,6 +44,21 @@ def _visible_size(page: Any) -> tuple[float, float]:
     return width, height
 
 
+def _page_size(page: Any) -> tuple[float, float]:
+    """Displayed size of a page in points, turned by its /Rotate."""
+    import pikepdf
+
+    try:
+        width, height = _visible_size(page)
+    except (ValueError, TypeError, pikepdf.PdfError):
+        width, height = 612.0, 792.0
+    if width < 1 or height < 1:
+        width, height = 612.0, 792.0
+    if _normalized_rotation(page.obj.get("/Rotate", 0)) in (90, 270):
+        width, height = height, width
+    return round(width, 2), round(height, 2)
+
+
 def _fsync(path: str) -> None:
     fd = os.open(path, os.O_RDONLY)
     try:
@@ -83,20 +98,12 @@ def ingest(tmp_path: str, dest_path: str) -> dict[str, Any]:
             raise PdfError("empty", "This PDF has no pages.")
         sizes: list[tuple[float, float]] = []
         for page in pdf.pages:
-            try:
-                width, height = _visible_size(page)
-            except (ValueError, TypeError, pikepdf.PdfError):
-                width, height = 612.0, 792.0
-            if width < 1 or height < 1:
-                width, height = 612.0, 792.0
             raw = page.obj.get("/Rotate", 0)
             rot = _normalized_rotation(raw)
             if type(raw) is not int or raw != rot:
                 # Store a plain multiple of 90, which every PDF tool reads alike (not 90.0 or /Foo).
                 page.obj.Rotate = rot
-            if rot in (90, 270):
-                width, height = height, width
-            sizes.append((round(width, 2), round(height, 2)))
+            sizes.append(_page_size(page))
         part = f"{dest_path}.{os.getpid()}.part"
         os.makedirs(os.path.dirname(dest_path), exist_ok=True)
         # Saving without `encryption` drops any owner-password encryption.
@@ -108,6 +115,14 @@ def ingest(tmp_path: str, dest_path: str) -> dict[str, Any]:
             raise
     _publish(part, dest_path)
     return {"page_count": count, "sizes": sizes}
+
+
+def page_sizes(path: str) -> list[tuple[float, float]]:
+    """Page sizes of a stored PDF, as ``ingest`` reports them."""
+    import pikepdf
+
+    with pikepdf.open(path) as pdf:
+        return [_page_size(page) for page in pdf.pages]
 
 
 def render_thumbnails(source_path: str, items: list[tuple[int, int, str]]) -> int:

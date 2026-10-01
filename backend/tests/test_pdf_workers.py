@@ -20,12 +20,13 @@ import pikepdf
 import pytest
 from pikepdf import Array, Name, String
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from academia import config
-from academia.db import read_session
-from academia.models import User
+from academia.db import read_session, write_session
+from academia.models import SourcePage, User
 from academia.services import pdfbuild, thumbs
+from academia.services.textindex import index_source, text_indexer
 from academia.storage import pdf_cache_path, source_path, thumb_path
 from academia.workers import pdfops, pool
 from conftest import make_pdf, new_notebook, upload
@@ -197,6 +198,62 @@ def test_page_size_is_the_crop_box_clipped_to_the_media_box(client, tmp_path: Pa
         pdf.save(path)
     src = upload(client, path)
     assert [(p["width"], p["height"]) for p in src["pages"]] == [(300, 400), (150, 200)]
+
+
+def cropped_pdf(path: Path) -> Path:
+    """Two pages (the second turned by its /Rotate) whose CropBox reaches past the MediaBox."""
+    make_pdf(path, pages=2, rotate={1: 90})  # MediaBox 300 x 400
+    with pikepdf.open(path, allow_overwriting_input=True) as pdf:
+        for page in pdf.pages:
+            page.obj.CropBox = Array([-50, -100, 350, 700])
+        pdf.save(path)
+    return path
+
+
+def store_sizes_as_older_releases_did(source_id: str) -> None:
+    """They stored the size of the raw CropBox."""
+    with write_session() as db:
+        for idx, (width, height) in enumerate([(400, 800), (800, 400)]):
+            db.execute(
+                update(SourcePage)
+                .where(SourcePage.source_id == source_id, SourcePage.idx == idx)
+                .values(width_pt=width, height_pt=height)
+            )
+
+
+def pdfium_sizes(path: Path) -> list[tuple[float, float]]:
+    import pypdfium2 as pdfium
+
+    doc = pdfium.PdfDocument(path)
+    try:
+        return [doc.get_page_size(i) for i in range(len(doc))]
+    finally:
+        doc.close()
+
+
+def test_sizes_stored_by_an_older_release_are_corrected_after_the_update(client, tmp_path: Path):
+    text_indexer.stop()  # the test does the indexer's work itself
+    src = upload(client, cropped_pdf(tmp_path / "crop.pdf"))
+    store_sizes_as_older_releases_did(src["id"])
+    nb = client.post("/api/notebooks", json={"name": "N", "source_id": src["id"]}).json()
+    # The update rebuilt the text index (migration 0003), so every upload is read once again.
+    index_source(src["id"])
+    pages = client.get(f"/api/notebooks/{nb['id']}").json()["pages"]
+    assert [(p["width"], p["height"]) for p in pages] == [(300, 400), (400, 300)]
+    assert pdfium_sizes(source_path(src["id"])) == [(300, 400), (400, 300)]
+
+
+def test_uploading_again_corrects_sizes_stored_by_an_older_release(client, tmp_path: Path):
+    text_indexer.stop()  # the upload itself must give the right sizes
+    path = cropped_pdf(tmp_path / "crop.pdf")
+    src = upload(client, path)
+    store_sizes_as_older_releases_did(src["id"])
+    again = upload(client, path)
+    assert again["id"] == src["id"]
+    assert [(p["width"], p["height"]) for p in again["pages"]] == [(300, 400), (400, 300)]
+    nb = client.post("/api/notebooks", json={"name": "N", "source_id": again["id"]}).json()
+    pages = client.get(f"/api/notebooks/{nb['id']}").json()["pages"]
+    assert [(p["width"], p["height"]) for p in pages] == [(300, 400), (400, 300)]
 
 
 def test_stored_and_built_pdfs_reach_the_disk_before_they_get_their_name(

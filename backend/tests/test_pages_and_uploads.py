@@ -22,7 +22,7 @@ from academia.models import Source, utcnow
 from academia.services import maintenance
 from academia.services import sources as sources_service
 from academia.storage import data_dir, tmp_dir
-from academia.workers import pdfops
+from academia.workers import pdfops, pool
 from conftest import make_pdf, new_notebook, page_texts, upload
 
 # ---- undo restores pages between their original neighbours -----------------------
@@ -222,6 +222,28 @@ def test_reupload_while_maintenance_deletes_orphan(client, tmp_path: Path, monke
         ids = list(db.scalars(select(Source.id)))
     assert ids == [second["id"]]
     assert _source_files() == [real(second["id"])]
+
+
+def test_reupload_while_maintenance_deletes_orphan_being_measured(client, tmp_path: Path, monkeypatch):  # noqa: ANN001
+    pdf = make_pdf(tmp_path / "a.pdf", pages=2)
+    first = upload(client, pdf)
+    with write_session() as db:
+        db.execute(update(Source).values(orphaned_at=utcnow() - timedelta(days=60)))
+
+    real = pool.run
+    fired: list[int] = []
+
+    def racing(fn, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003, ANN202
+        if fn is pdfops.page_sizes and not fired:
+            fired.append(maintenance.delete_orphaned_sources(utcnow()))
+        return real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(pool, "run", racing)
+    second = upload(client, pdf)
+    assert fired == [1]
+    assert second["id"] != first["id"]
+    assert second["page_count"] == 2
+    assert _source_files() == [sources_service.source_path(second["id"])]
 
 
 # ---- uploads waiting for PDF workers do not hold the shared thread pool -------------

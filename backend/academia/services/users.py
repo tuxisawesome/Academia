@@ -74,17 +74,19 @@ def create_user(
     must_change: bool = True,
 ) -> tuple[User, str | None]:
     username = validate_username(username)
-    if find_user(db, username) is not None:
-        raise Conflict("That username is already taken.", code="username_taken")
     generated = None
     if password:
         validate_new_password(password)
     else:
         password = generated = generate_password()
+    # As in auth.login, Argon2 runs before the first query starts the write transaction.
+    password_hash = hash_password(password)
+    if find_user(db, username) is not None:
+        raise Conflict("That username is already taken.", code="username_taken")
     user = User(
         username=username,
         display_name=clean_display_name(display_name),
-        password_hash=hash_password(password),
+        password_hash=password_hash,
         is_admin=is_admin,
         must_change_password=must_change,
         prefs={},
@@ -116,6 +118,13 @@ def update_user(
     disabled: bool | None = None,
     reset_password: bool = False,
 ) -> tuple[User, str | None]:
+    generated = new_hash = None
+    if reset_password:
+        if user_id == actor.id:
+            raise BadRequest("Use Settings → Account to change your own password.", code="self_change")
+        # As in auth.login, Argon2 runs before the first query starts the write transaction.
+        generated = generate_password()
+        new_hash = hash_password(generated)
     user = db.get(User, user_id)
     if user is None:
         raise NotFound("User not found.")
@@ -137,12 +146,8 @@ def update_user(
         else:
             user.disabled_at = None
             login_limiter.success(user.username)
-    generated = None
-    if reset_password:
-        if user.id == actor.id:
-            raise BadRequest("Use Settings → Account to change your own password.", code="self_change")
-        generated = generate_password()
-        user.password_hash = hash_password(generated)
+    if new_hash is not None:
+        user.password_hash = new_hash
         user.must_change_password = True
         revoke_user_sessions(db, user.id)
         # Let the user sign in with the new password straight away, even if locked out.

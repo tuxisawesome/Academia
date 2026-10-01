@@ -74,7 +74,7 @@ def _clear_cookies(response: Response) -> None:
 def login(body: LoginBody, request: Request, response: Response, db: Db) -> dict[str, Any]:
     ip = _client_ip(request)
     username = body.username.strip()
-    login_limiter.check(username)
+    login_limiter.check(username, ip)
     # Argon2 runs outside any write transaction: holding the database's write lock for it
     # would make every sign-in and every other write wait in line.
     with read_session() as rdb:
@@ -126,7 +126,7 @@ def me(user: AnyUser) -> dict[str, Any]:
 @router.post("/auth/password")
 def change_password(body: PasswordBody, request: Request, user: AnyUser, db: Db) -> dict[str, Any]:
     ip = _client_ip(request)
-    login_limiter.check(user.username)
+    login_limiter.check(user.username, ip)
     # As in login, Argon2 runs before the write transaction starts.
     if not verify_password(user.password_hash, body.current_password):
         login_limiter.failure(ip)

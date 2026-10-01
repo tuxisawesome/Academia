@@ -220,11 +220,15 @@ export function ExplorerPage() {
   function onContextMenu(e: React.MouseEvent) {
     const fromKeyboard = keyboardMenu.current;
     keyboardMenu.current = false;
+    // React bubbles a right-click in a tile's portalled "…" menu up to here, but it is not on the list.
+    if (!e.currentTarget.contains(e.target as Node)) {
+      e.preventDefault();
+      return;
+    }
     targetMenuAt(e.target as HTMLElement, fromKeyboard);
   }
 
   function targetMenuAt(target: HTMLElement, fromKeyboard: boolean) {
-    if (isEditableTarget(target)) return;
     const el = target.closest<HTMLElement>("[data-node-id]");
     if (el) {
       const id = el.dataset.nodeId!;
@@ -345,7 +349,14 @@ export function ExplorerPage() {
       </div>
 
       <ContextMenu.Root onOpenChange={longPress.onOpenChange}>
-        <ContextMenu.Trigger asChild>
+        <ContextMenu.Trigger
+          asChild
+          // Radix opens the list's menu after a long touch or pen press, also one in a tile's portalled
+          // "…" menu (React bubbles it up here). Cancelling such a press keeps that menu closed.
+          onPointerDown={(e) => {
+            if (e.pointerType !== "mouse" && !e.currentTarget.contains(e.target as Node)) e.preventDefault();
+          }}
+        >
           <div
             ref={contentRef}
             className={`explorer-content ${fileDrag ? "file-drag" : ""}`}

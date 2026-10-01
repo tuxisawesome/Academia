@@ -100,7 +100,8 @@ function Reader() {
   const eventBusRef = useRef<EventBus | null>(null);
   const initialPage = useRef<number | null>(null);
   const initialScale = useRef("page-fit");
-  // The pages of the document in the viewer, to find its current page again in a new revision.
+  // The pages of the document in the viewer, which its page numbers (`current`) count. `pages`
+  // moves on to a new revision as soon as it is fetched, while its PDF is still loading.
   const shownPages = useRef<PageRef[]>([]);
   // The page the reader went to, which a two-page spread shows but does not make current.
   const keptPage = useRef<number | null>(null);
@@ -385,11 +386,12 @@ function Reader() {
     return () => ro.disconnect();
   }, [applyLayout, sidebar]);
 
-  // Save reading position.
+  // Save reading position: the page on screen.
   const pendingSave = useRef<(() => void) | null>(null);
   useEffect(() => {
-    if (!id || loading || !pages[current - 1]) return;
-    const json = { page_id: pages[current - 1].id, page_index: current - 1 };
+    const shown = shownPages.current;
+    if (!id || loading || !shown[current - 1]) return;
+    const json = { page_id: shown[current - 1].id, page_index: current - 1 };
     let saved = false;
     const save = (keepalive = false) => {
       if (saved) return;
@@ -400,7 +402,7 @@ function Reader() {
     pendingSave.current = () => save(true);
     const t = setTimeout(save, 800);
     return () => clearTimeout(t);
-  }, [current, id, pages, loading]);
+  }, [current, id, loading]);
   // A page turned just before leaving the reader, or the app, is saved too.
   useEffect(() => {
     const flush = () => pendingSave.current?.();
@@ -511,8 +513,9 @@ function Reader() {
   ];
 
   const bookmarkSpread = async () => {
-    if (!nb) return;
-    const ids = visible.map((n) => pages[n - 1]?.id).filter(Boolean) as string[];
+    // The pages on screen.
+    const ids = visible.map((n) => shownPages.current[n - 1]?.id).filter(Boolean) as string[];
+    if (!nb || !ids.length) return;
     const name = await promptDialog({
       title: "Bookmark these pages",
       message: `Pages ${indicator} of “${nb.name}”. The bookmark is saved next to the notebook.`,

@@ -139,16 +139,29 @@ def test_moving_a_folder_into_a_deeply_nested_descendant_is_refused(client):
     assert len(client.get("/api/tree").json()) == 260
 
 
-def test_bulk_actions_on_more_than_5000_items(client):
+def test_bulk_actions_are_limited_to_5000_items(client):
     target = client.post("/api/folders", json={"name": "Target"}).json()
     owner = owner_of(target["id"])
     ids = [new_id() for _ in range(5001)]
     with write_session() as db:
         db.add_all(Node(id=i, owner_id=owner, kind=FOLDER, name=f"F{n}") for n, i in enumerate(ids))
 
-    # Select all in a folder holding more than 5000 items, then Delete (or Cut and Paste).
+    # Each item is handled on its own while the request holds the database's write lock, so a
+    # larger selection is refused up front, with a message people can act on.
+    for path in ("nodes/trash-check", "nodes/trash", "nodes/move", "nodes/copy", "trash/restore", "trash/purge"):
+        r = client.post(f"/api/{path}", json={"ids": ids, "target_id": target["id"]})
+        assert r.status_code == 422, path
+        assert r.json()["error"] == {
+            "code": "too_many_items",
+            "message": "You can act on at most 5,000 items at a time.",
+        }
+    assert names(client, target["id"]) == []
+    assert client.get("/api/trash").json() == []
+
+    # Select all in a folder holding 5000 items, then Delete (or Cut and Paste).
+    ids = ids[:5000]
     assert client.post("/api/nodes/trash-check", json={"ids": ids}).json() == {"bookmarks_elsewhere": 0}
-    assert client.post("/api/nodes/move", json={"ids": ids, "target_id": target["id"]}).json() == {"moved": 5001}
-    assert client.post("/api/nodes/trash", json={"ids": ids}).json() == {"trashed": 5001}
-    assert client.post("/api/trash/purge", json={"ids": ids}).json() == {"purged": 5001}
+    assert client.post("/api/nodes/move", json={"ids": ids, "target_id": target["id"]}).json() == {"moved": 5000}
+    assert client.post("/api/nodes/trash", json={"ids": ids}).json() == {"trashed": 5000}
+    assert client.post("/api/trash/purge", json={"ids": ids}).json() == {"purged": 5000}
     assert client.get("/api/trash").json() == []

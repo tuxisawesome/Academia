@@ -1,5 +1,7 @@
+import { QueryObserver } from "@tanstack/react-query";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createBookmark, deletePages, reorderPages, rotatePages, setBookmarkPages, undeletePages } from "./actions";
+import { api } from "./client";
 import { queryClient } from "./queries";
 import type { NotebookDetail } from "./types";
 
@@ -30,10 +32,14 @@ function notebook(id: string, rev: number, pageIds = ["p1", "p2", "p3"]): Notebo
 
 /** Stands in for the server: like check_rev in pages.py, a base_rev other than the current rev is a 409. */
 function fakeServer(id: string, rev: number) {
-  const server = { rev, sent: [] as Body[] };
+  const server = { rev, pageIds: ["p1", "p2", "p3"], sent: [] as Body[] };
   vi.stubGlobal(
     "fetch",
-    vi.fn(async (_url: string, init: RequestInit) => {
+    vi.fn(async (url: string, init: RequestInit) => {
+      if (init.method === "GET") {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return reply(200, notebook(id, server.rev, server.pageIds));
+      }
       const body = JSON.parse(String(init.body)) as Body;
       server.sent.push(body);
       await new Promise((resolve) => setTimeout(resolve, 5));
@@ -41,10 +47,21 @@ function fakeServer(id: string, rev: number) {
         return reply(409, { error: { code: "stale_rev", message: "This notebook was changed somewhere else." } });
       }
       server.rev += 1;
-      return reply(200, notebook(id, server.rev));
+      if (url.endsWith("/pages/order")) server.pageIds = body.page_ids as string[];
+      return reply(200, notebook(id, server.rev, server.pageIds));
     }),
   );
   return server;
+}
+
+/** The page orders the notebook page shows, as the cached notebook changes. */
+function watchOrder(id: string) {
+  const shown: string[] = [];
+  const unsubscribe = queryClient.getQueryCache().subscribe(() => {
+    const order = queryClient.getQueryData<NotebookDetail>(["notebook", id])?.pages.map((p) => p.id).join(",");
+    if (order && order !== shown[shown.length - 1]) shown.push(order);
+  });
+  return { shown, unsubscribe };
 }
 
 afterEach(() => {
@@ -90,6 +107,76 @@ describe("notebook edits", () => {
     await Promise.all([undeletePages(nb.id, "batch-1"), rotatePages(afterDelete, ["p2"], 90)]);
     expect(server.sent.map((body) => body.base_rev)).toEqual([1, undefined, 3]);
     expect(server.rev).toBe(4);
+  });
+
+  it("moves past an undo that waited for another edit", async () => {
+    const nb = notebook("nb-queued-undo", 1);
+    const server = fakeServer(nb.id, 1);
+    queryClient.setQueryData(["notebook", nb.id], nb);
+    // Rotate, undo a delete and rotate again, each before the response to the one before.
+    await Promise.all([rotatePages(nb, ["p1"], 90), undeletePages(nb.id, "batch-1"), rotatePages(nb, ["p2"], 90)]);
+    expect(server.sent.map((body) => body.base_rev)).toEqual([1, undefined, 3]);
+    expect(server.rev).toBe(4);
+  });
+
+  it("keeps showing a drag that waits for the drag before it", async () => {
+    const nb = notebook("nb-drag-shown", 4);
+    const server = fakeServer(nb.id, 4);
+    queryClient.setQueryData(["notebook", nb.id], nb);
+    const { shown, unsubscribe } = watchOrder(nb.id);
+    await Promise.all([reorderPages(nb, ["p2", "p3", "p1"]), reorderPages(nb, ["p3", "p1", "p2"])]);
+    unsubscribe();
+    // The first drag's response would show the order from before the second drag again.
+    expect(shown).toEqual(["p2,p3,p1", "p3,p1,p2"]);
+    expect(server.pageIds).toEqual(["p3", "p1", "p2"]);
+  });
+
+  it("keeps showing a drag that waits for a rotation", async () => {
+    const nb = notebook("nb-rotate-drag", 1);
+    fakeServer(nb.id, 1);
+    queryClient.setQueryData(["notebook", nb.id], nb);
+    const { shown, unsubscribe } = watchOrder(nb.id);
+    await Promise.all([rotatePages(nb, ["p1"], 90), reorderPages(nb, ["p3", "p1", "p2"])]);
+    unsubscribe();
+    expect(shown).toEqual(["p3,p1,p2"]);
+  });
+
+  it("reloads the library when a drag fails after an edit it held back", async () => {
+    const nb = notebook("nb-held-back", 1);
+    fakeServer(nb.id, 1);
+    const server = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (url, init) =>
+      String(url).endsWith("/pages/order")
+        ? reply(400, { error: { code: "invalid", message: "Those pages are not all in this notebook." } })
+        : server(url, init),
+    );
+    queryClient.setQueryData(["notebook", nb.id], nb);
+    queryClient.setQueryData(["nodes", null], []);
+    // Delete a page, then drag before the delete's response arrives.
+    const results = await Promise.allSettled([deletePages(nb, ["p1"]), reorderPages(nb, ["p3", "p2", "p1"])]);
+    expect(results.map((r) => r.status)).toEqual(["fulfilled", "rejected"]);
+    // The folder shows the notebook's page count and cover, which the delete changed.
+    expect(queryClient.getQueryState(["nodes", null])?.isInvalidated).toBe(true);
+  });
+
+  it("keeps showing a drag made while the notebook is reloading", async () => {
+    const nb = notebook("nb-reload-drag", 1);
+    fakeServer(nb.id, 1);
+    queryClient.setQueryData(["notebook", nb.id], nb);
+    // The notebook page is open, so reloads (after an edit, on focus) refetch it.
+    const page = new QueryObserver(queryClient, {
+      queryKey: ["notebook", nb.id],
+      queryFn: () => api<NotebookDetail>(`/notebooks/${nb.id}`),
+    });
+    const leave = page.subscribe(() => undefined);
+    const { shown, unsubscribe } = watchOrder(nb.id);
+    void queryClient.invalidateQueries({ queryKey: ["notebook", nb.id] });
+    await reorderPages(nb, ["p3", "p1", "p2"]);
+    await vi.waitFor(() => expect(queryClient.isFetching()).toBe(0));
+    unsubscribe();
+    leave();
+    // The reload left before the drag, so it would bring back the order from before it.
+    expect(shown.slice(shown.indexOf("p3,p1,p2"))).toEqual(["p3,p1,p2"]);
   });
 });
 

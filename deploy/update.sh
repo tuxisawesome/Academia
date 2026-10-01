@@ -50,7 +50,7 @@ DOMAIN=$(conf_get DOMAIN)
 TLS_MODE=$(conf_get TLS_MODE auto)
 ACME_EMAIL=$(saved_email)
 HTTP_PORT=$(conf_get HTTP_PORT 8080)
-TRUSTED_PROXIES=$(conf_get TRUSTED_PROXIES "$DEFAULT_TRUSTED_PROXIES")
+TRUSTED_PROXIES=$(saved_proxies)
 REPO_URL=$(conf_get REPO_URL "$DEFAULT_REPO")
 BRANCH=$(conf_get BRANCH "$DEFAULT_BRANCH")
 load_versions "$HERE"
@@ -70,17 +70,26 @@ restart_set_aside_release() { # on_error cleanup during a --force rebuild
   systemctl start academia || true
 }
 
-on_interrupt() { # Ctrl+C or SIGTERM: undo what on_error would undo, then stop
-  trap '' INT TERM
-  printf '\n' >&2
+on_interrupt() { # Ctrl+C, SIGTERM or a lost connection (SIGHUP): undo what on_error would undo, then stop
+  trap '' INT TERM HUP
+  printf '\n' >&2 || true
   warn "Interrupted."
   if [[ -n $ON_ERROR_CLEANUP ]]; then $ON_ERROR_CLEANUP || true; fi
   exit 130
 }
 
-caddy_refresh_failed() { # on_error note for the last step (re-running the update would only say "up to date")
+caddy_refresh_failed() { # the last step failed: finish here, as re-running the update would only say "up to date"
+  prune_releases
+  log "Update finished; the web server configuration could not be refreshed"
   warn "Academia ${COMMIT:0:12} is installed and running; only the web server configuration could not be refreshed."
-  warn "Fix the problem (check with: sudo caddy validate --config /etc/caddy/Caddyfile), then run: sudo systemctl reload caddy"
+  render_caddy_site
+  if cmp -s "$CADDY_SITE.new" "$CADDY_SITE"; then
+    warn "Fix the problem (check with: sudo caddy validate --config /etc/caddy/Caddyfile), then run: sudo systemctl reload caddy"
+  else # Caddy rejected it and the previous one was put back, so a reload would not apply it
+    warn "Fix the problem Caddy reported above, then write the configuration again with: sudo academia-update --force"
+  fi
+  rm -f "$CADDY_SITE.new"
+  exit 1
 }
 
 rollback() {
@@ -105,12 +114,16 @@ rollback() {
     say "No database backup from that update was found; the current database is kept."
   fi
   if [[ $ASSUME_YES -eq 0 ]]; then
-    ask_yes_no "Continue?" n || exit 0
+    [[ $HAVE_TTY -eq 1 ]] || die "No terminal to confirm the rollback; run it again with --yes."
+    ask_yes_no "Continue?" n || {
+      say "Nothing was changed."
+      exit 0
+    }
   fi
   trap 'on_error $LINENO' ERR
-  # Seconds from here to the end: an interruption would leave Academia stopped or half restored,
-  # so Ctrl+C and SIGTERM are ignored (by the commands run here, too).
-  trap '' INT TERM
+  # Seconds from here to the end: an interruption or a lost connection would leave Academia stopped
+  # or half restored, so Ctrl+C, SIGTERM and SIGHUP are ignored (by the commands run here, too).
+  trap '' INT TERM HUP
   STEP_TOTAL=2
   step "Restoring the previous version"
   run systemctl stop academia
@@ -133,18 +146,29 @@ rollback() {
 }
 
 main_update() {
-  local old new
+  local old new repair=0
   old=$(current_commit)
   new=$COMMIT
   [[ -n $new ]] || die "No version given. Run this through: sudo academia-update"
+  # A --force rebuild cut off without cleaning up (a power cut, a killed process) leaves Academia
+  # stopped, its release half built or its complete copy set aside: rebuilt, not "up to date".
+  if [[ $old == "$new" ]] && [[ ! -f $RELEASES_DIR/$old/.complete || -d $RELEASES_DIR/$old.old ]]; then
+    repair=1
+  fi
 
   if [[ $CHECK -eq 1 ]]; then
-    if [[ $old == "$new" ]]; then
+    if [[ $repair -eq 1 ]]; then
+      say "The last rebuild of Academia ${old:0:12} did not finish. Repair it with: sudo academia-update"
+    elif [[ $old == "$new" ]]; then
       say "Academia is up to date (${old:0:12})."
     else
       say "An update is available: ${old:0:12} → ${new:0:12}. Install it with: sudo academia-update"
     fi
     exit 0
+  fi
+  if [[ $repair -eq 1 ]]; then
+    say "The last rebuild of Academia ${new:0:12} did not finish; it is rebuilt now."
+    FORCE=1
   fi
   if [[ $old == "$new" && $FORCE -eq 0 ]]; then
     say "Academia is already up to date (${new:0:12})."
@@ -152,7 +176,7 @@ main_update() {
   fi
 
   trap 'on_error $LINENO' ERR
-  trap on_interrupt INT TERM
+  trap on_interrupt INT TERM HUP
   log "Update started: ${old:0:12} -> ${new:0:12}"
   say "${C_BOLD}Updating Academia${C_RESET} ${old:0:12} → ${new:0:12}"
   STEP_TOTAL=5
@@ -185,9 +209,10 @@ main_update() {
   fi
   build_release "$new"
 
-  # From here until the new version answers (seconds), an interruption would leave Academia
-  # stopped or half migrated, so Ctrl+C and SIGTERM are ignored (by the commands run here, too).
-  trap '' INT TERM
+  # From here until the new version answers (seconds), an interruption or a lost connection would
+  # leave Academia stopped or half migrated, so Ctrl+C, SIGTERM and SIGHUP are ignored (by the
+  # commands run here, too).
+  trap '' INT TERM HUP
   step "Backing up and migrating the database"
   run systemctl stop academia
   local backup
@@ -224,11 +249,12 @@ main_update() {
     die "Update failed and was rolled back to ${old:0:12}. See: sudo journalctl -u academia -n 80"
   fi
   ok "Academia is running ${new:0:12}"
-  trap on_interrupt INT TERM
+  # Still ignored while the set-aside copy is deleted: on_interrupt would put back what is left of it.
   if [[ -n $SET_ASIDE ]]; then
     rm -rf "$SET_ASIDE"
     SET_ASIDE="" ON_ERROR_CLEANUP=""
   fi
+  trap on_interrupt INT TERM HUP
   # Recorded now, so that --rollback is right even if the web server step below fails.
   state_set CURRENT "$new"
   if [[ -n $old && $old != "$new" ]]; then
@@ -237,6 +263,10 @@ main_update() {
   fi
 
   step "Refreshing the web server configuration"
+  # --tls off sites used to hide the HTTPS of the proxy in front from the app. With trusted_proxies
+  # the app sees it, and over HTTPS it ignores the plain session cookie it gave out until now.
+  local sign_in_again=0
+  if [[ $TLS_MODE == off && -f $CADDY_SITE ]] && ! grep -q trusted_proxies "$CADDY_SITE"; then sign_in_again=1; fi
   ON_ERROR_CLEANUP=caddy_refresh_failed
   install_caddy_site
   ON_ERROR_CLEANUP=""
@@ -245,7 +275,15 @@ main_update() {
   say ""
   say "${C_GREEN}${C_BOLD}Academia was updated to ${new:0:12}.${C_RESET}"
   say "Open browser tabs will offer to reload. If something is wrong: sudo academia-update --rollback"
+  if [[ $sign_in_again -eq 1 ]]; then
+    say "${C_YELLOW}Everyone who uses Academia through your HTTPS proxy or tunnel has to sign in once more:"
+    say "Academia now sees that their connection is HTTPS, and their earlier sign-in was made for plain HTTP.${C_RESET}"
+  fi
 }
+
+# With the output piped (`| tee`), a lost connection also ends the reader: writing then fails
+# (the output helpers go on) instead of killing the update, as on a terminal that is gone.
+trap : PIPE
 
 if [[ $ROLLBACK -eq 1 ]]; then
   rollback

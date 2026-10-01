@@ -29,8 +29,12 @@ export const useUploads = create<UploadState>((set) => ({
   clearFinished: () => set((s) => ({ items: s.items.filter((i) => i.status === "uploading" || i.status === "processing") })),
 }));
 
+// Counts the sessions that ended, so a batch of uploads can tell it has outlived its own.
+let endedSessions = 0;
+
 // The tray lists the signed-in user's files: stop their uploads and forget them when the session ends.
 onSessionEnd(() => {
+  endedSessions++;
   for (const item of useUploads.getState().items) item.abort?.();
   useUploads.setState({ items: [] });
 });
@@ -77,13 +81,17 @@ export async function uploadAsNotebooks(files: File[], folderId: string | null):
 /** Appends each PDF (in order) to the end of an existing notebook. */
 export async function appendToNotebook(files: File[], notebookId: string): Promise<void> {
   const pdfs = pdfsOnly(files);
+  const session = endedSessions;
   for (const file of pdfs) {
+    // The session ended meanwhile: the remaining files are neither sent nor listed for whoever signs in next.
+    if (endedSessions !== session) return;
     await runUpload(file, async (sourceId) => {
       const detail = await api<NotebookDetail>(`/notebooks/${notebookId}/pages/insert`, {
         method: "POST",
         json: { base_rev: null, source_id: sourceId, at: "end" },
       });
-      queryClient.setQueryData(["notebook", notebookId], detail);
+      // Not cached for whoever signs in next.
+      if (endedSessions === session) queryClient.setQueryData(["notebook", notebookId], detail);
     });
   }
   if (pdfs.length) await invalidateLibrary();

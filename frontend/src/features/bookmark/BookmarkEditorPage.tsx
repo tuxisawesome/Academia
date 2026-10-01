@@ -155,6 +155,19 @@ export function BookmarkEditorPage() {
     }
   }
 
+  // Reachable by Back or an old link; the server rejects every change to it.
+  if (bookmark?.trashed_at && !loading) {
+    return (
+      <div className="center-fill">
+        <div className="empty">
+          <h3>Bookmark in Trash</h3>
+          <p>“{bookmark.name}” is in the Trash. Restore it to edit it.</p>
+          <Link to="/trash">Open the Trash</Link>
+        </div>
+      </div>
+    );
+  }
+
   if (nb?.trashed_at && !loading) {
     return (
       <div className="center-fill">

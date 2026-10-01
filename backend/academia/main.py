@@ -158,6 +158,10 @@ def _register_errors(app: FastAPI) -> None:
     @app.exception_handler(RequestValidationError)
     async def validation_error(_request: Request, exc: RequestValidationError) -> JSONResponse:
         first = exc.errors()[0] if exc.errors() else {}
+        if first.get("type") == "too_long":
+            # A list longer than allowed: people get there by selecting very many items at once.
+            limit = first["ctx"]["max_length"]
+            return _error(422, "too_many_items", f"You can act on at most {limit:,} items at a time.")
         field = ".".join(str(p) for p in first.get("loc", [])[1:])
         message = first.get("msg", "Invalid request.")
         return _error(422, "validation", f"{field}: {message}" if field else message)

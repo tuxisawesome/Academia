@@ -130,6 +130,8 @@ sudo academia-update --rollback   # go back to the version before the last updat
 
 After an update, open browser tabs show **"Academia has been updated — Reload"**.
 
+With `--tls off`, the first update to a version that passes the proxy's HTTPS on to Academia (see `--trusted-proxies`) signs out everyone who uses Academia through that proxy or tunnel. They only have to sign in once more, and the update says so when this happens.
+
 ## Administration
 
 - **Managing users:** Administrators manage accounts in the web app (avatar menu → **Manage users**): add users, reset passwords, disable, make administrator, delete. New users get a temporary password and choose their own at first sign-in.
@@ -209,7 +211,7 @@ sudo rm -rf /opt/academia /etc/academia /usr/local/bin/academia /usr/local/bin/a
 - **"Request blocked: unexpected origin." behind your own proxy (`--tls off`).** This can happen in older browsers when the proxy changes the `Host` header.
   - Make the proxy pass on the original `Host` header (with nginx: `proxy_set_header Host $host;`).
   - Or add the public address to `/etc/academia/academia.env` as `ACADEMIA_EXTRA_ORIGINS='["https://academia.example.com"]'`, then run `sudo systemctl restart academia`.
-- **You're locked out.** `sudo academia reset-password <user>` prints a new temporary password. If sign-in then still reports too many failed attempts, wait 15 minutes or run `sudo systemctl restart academia`. (A reset from the Users page in the app lifts that limit straight away.)
+- **You're locked out.** `sudo academia reset-password <user>` prints a new temporary password. If sign-in then still reports too many failed attempts, wait 15 minutes or run `sudo systemctl restart academia`. (A reset from the Users page in the app lifts that limit straight away. It doesn't lift the limit on a network address that 100 failed sign-ins came from within 15 minutes.)
 - **An update failed.** It was rolled back automatically, and the reason is in `/var/log/academia-install.log` and `sudo journalctl -u academia`.
 
 ## Development

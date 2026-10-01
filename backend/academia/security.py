@@ -117,11 +117,16 @@ class LoginRateLimiter:
 
     The per-username limit is enforced before the password is checked. The per-IP limit is
     shared by everyone behind one address (a school's NAT, or every client when the app sits
-    behind a tunnel), so it only turns away wrong passwords and never a correct one.
+    behind a tunnel), so it only turns away wrong passwords and never a correct one. Only an
+    address with many times that many failures is turned away before the password is checked,
+    which bounds the guesses one address can spread over all accounts and the Argon2 work it
+    can cause.
     """
 
     def __init__(self, per_ip: int = 20, per_user: int = 8, window_s: int = 900, max_buckets: int = 10000) -> None:
         self.per_ip = per_ip
+        # Far more failures than a class behind one address makes.
+        self.ip_cap = 5 * per_ip
         self.per_user = per_user
         self.window = window_s
         self.max_buckets = max_buckets
@@ -158,14 +163,17 @@ class LoginRateLimiter:
                 code="rate_limited",
             )
 
-    def check(self, username: str) -> None:
-        """Start an attempt for ``username``, or raise 429 if it has failed too often.
+    def check(self, username: str, ip: str) -> None:
+        """Start an attempt for ``username`` from ``ip``, or raise 429 if the account has failed
+        too often or the address has reached its cap.
 
         The attempt counts as failed until ``success()``, so concurrent guesses can't all
         get past the limit before the first of them is verified.
         """
         now = time.monotonic()
         with self._lock:
+            self._limit(self._prune(self._ip, ip, now), self.ip_cap, now)
+            self._bound(self._ip, now)
             user_q = self._prune(self._user, username.lower(), now)
             self._limit(user_q, self.per_user, now)
             user_q.append(now)
@@ -176,9 +184,12 @@ class LoginRateLimiter:
         now = time.monotonic()
         with self._lock:
             ip_q = self._prune(self._ip, ip, now)
-            self._limit(ip_q, self.per_ip, now)
+            over = len(ip_q) >= self.per_ip
+            # Failures over the limit are counted too, towards the cap that check() enforces.
             ip_q.append(now)
             self._bound(self._ip, now)
+            if over:
+                self._limit(ip_q, self.per_ip, now)
 
     def success(self, username: str) -> None:
         """Forget the failed attempts for ``username`` (correct password or admin reset)."""

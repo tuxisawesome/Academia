@@ -36,6 +36,15 @@ def index_source(source_id: str) -> int:
     path = source_path(source_id)
     if not todo or not path.exists():
         return 0
+    if not done:
+        # The first read since the upload was stored, or since the update that rebuilt this
+        # index (migration 0003): also correct page sizes that an older release stored.
+        from .sources import remeasure  # sources imports this module
+
+        try:
+            remeasure(source_id)
+        except Exception:  # noqa: BLE001 - best effort; the text matters more
+            log.exception("Could not measure the pages of %s", source_id)
     indexed = 0
     for start in range(0, len(todo), BATCH):
         chunk = todo[start : start + BATCH]
@@ -55,7 +64,10 @@ def index_source(source_id: str) -> int:
 
 
 def sources_needing_text() -> list[str]:
-    """Sources with pages whose text layer hasn't been extracted yet (oldest first)."""
+    """Sources with pages whose text layer hasn't been extracted yet (oldest first).
+
+    Unused uploads are left out; they are queued when they are used again.
+    """
     with read_session() as db:
         done = dict(db.execute(select(PageText.source_id, func.count()).group_by(PageText.source_id)).all())
         rows = db.execute(

@@ -28,7 +28,9 @@ class NodePatch(BaseModel):
 
 
 class IdsBody(BaseModel):
-    ids: list[str] = Field(min_length=1, max_length=100_000)
+    # Each item is handled on its own while the request holds the database's write lock: more
+    # items would keep everyone else's changes waiting past the busy timeout.
+    ids: list[str] = Field(min_length=1, max_length=5000)
 
 
 class TargetBody(IdsBody):

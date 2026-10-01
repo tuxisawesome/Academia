@@ -6,7 +6,7 @@ from sqlalchemy import func, select, text
 
 from academia.db import read_session
 from academia.models import PageText
-from academia.services.textindex import index_source, sources_needing_text
+from academia.services.textindex import index_source, sources_needing_text, text_indexer
 from conftest import make_pdf, make_text_pdf, new_notebook, upload
 
 
@@ -119,6 +119,7 @@ def test_contents_are_private_and_never_returned(client, other_client, tmp_path:
 
 
 def test_phrases_and_pages_without_text(client, tmp_path: Path):
+    text_indexer.stop()  # the test counts the pages it indexes itself
     text_notebook(client, tmp_path, "Laws", ["second law of thermodynamics", "the law, second edition"])
     assert [m["number"] for m in search(client, "second law")["contents"][0]["matches"]] == [1, 2]
     assert [m["number"] for m in search(client, '"second law"')["contents"][0]["matches"]] == [1]

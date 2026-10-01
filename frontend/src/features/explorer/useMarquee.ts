@@ -54,7 +54,8 @@ export function useMarquee(
     const el = containerRef.current;
     if (!el || e.button !== 0 || e.pointerType === "touch") return;
     const target = e.target as HTMLElement;
-    if (target.closest("[data-node-id], button, input, a, .no-marquee")) return;
+    // React also bubbles presses in portalled content (an item's "…" menu) up to the container.
+    if (!el.contains(target) || target.closest("[data-node-id], button, input, a, .no-marquee")) return;
     const box = el.getBoundingClientRect();
     // Ignore clicks on the scrollbar.
     if (e.clientX > box.left + el.clientWidth || e.clientY > box.top + el.clientHeight) return;

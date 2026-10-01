@@ -18,7 +18,8 @@ from academia.api import auth as auth_api
 from academia.db import write_session
 from academia.errors import TooManyRequests
 from academia.models import Session, utcnow
-from conftest import PASSWORD, add_user, login
+from academia.services import users as users_service
+from conftest import ORIGIN, PASSWORD, add_user, login
 
 HTTPS_ORIGIN = "https://testserver"
 
@@ -71,6 +72,18 @@ def test_change_password_hashes_without_write_lock(anon, monkeypatch):
     assert anon.get("/api/auth/me").status_code == 200
     anon.post("/api/auth/logout")
     login(anon, "dora", "a much better password")
+
+
+def test_admin_reset_and_new_user_hash_without_write_lock(client, monkeypatch):
+    uid = add_user("kate")
+    seen: list[bool] = []
+    real = users_service.hash_password
+    monkeypatch.setattr(users_service, "hash_password", lambda p: seen.append(_write_lock_free()) or real(p))
+    r = client.patch(f"/api/admin/users/{uid}", json={"reset_password": True})
+    assert r.status_code == 200, r.text
+    r = client.post("/api/admin/users", json={"username": "liam"})
+    assert r.status_code == 200, r.text
+    assert seen == [True, True]
 
 
 def test_slow_login_does_not_block_other_writes(client, anon, monkeypatch):
@@ -221,30 +234,68 @@ def test_shared_address_failures_do_not_block_correct_login(anon):
     assert r.json()["error"]["code"] == "rate_limited"
 
 
+# An address that keeps failing is turned away before any password is checked: guesses spread
+# over many accounts, and the Argon2 work they cost, stay bounded.
+
+
+def test_address_far_over_its_limit_is_refused_before_verification(app, anon, monkeypatch):
+    add_user("frank")
+    login(anon, "frank")
+    real = security._hasher
+    verified = 0
+
+    class CountingHasher:
+        def verify(self, _h, _p):
+            nonlocal verified
+            verified += 1
+            return False
+
+    monkeypatch.setattr(security, "_hasher", CountingHasher())
+    codes = [
+        anon.post("/api/auth/login", json={"username": f"student{i}", "password": "springtime-2026"}).status_code
+        for i in range(100)
+    ]
+    assert codes == [401] * 20 + [429] * 80
+    assert verified == 100
+    for username in ("student100", "frank"):
+        r = anon.post("/api/auth/login", json={"username": username, "password": PASSWORD})
+        assert r.status_code == 429
+        assert r.json()["error"]["code"] == "rate_limited"
+    r = anon.post("/api/auth/password", json={"current_password": PASSWORD, "new_password": "a much better password"})
+    assert r.status_code == 429
+    assert verified == 100
+
+    # Other addresses are not affected.
+    monkeypatch.setattr(security, "_hasher", real)
+    with TestClient(app, base_url=ORIGIN, headers={"Origin": ORIGIN}, client=("192.0.2.7", 50000)) as elsewhere:
+        login(elsewhere, "frank")
+
+
 # Concurrent attempts must not slip past the per-username limit.
 
 
 def test_in_flight_attempts_count_towards_user_limit():
     limiter = security.LoginRateLimiter()
     for _ in range(8):
-        limiter.check("alice")
+        limiter.check("alice", "10.0.0.1")
     with pytest.raises(TooManyRequests):
-        limiter.check("alice")
+        limiter.check("alice", "10.0.0.1")
     limiter.success("alice")
-    limiter.check("alice")
+    limiter.check("alice", "10.0.0.1")
 
 
 def test_spraying_usernames_does_not_reset_a_locked_account():
-    """With the per-address limit no longer turning attempts away before verification, one
-    client can spray usernames; keeping memory bounded must not wipe a guessed account's count."""
+    """With the per-address limit turning attempts away before verification only far above its
+    limit, one client can spray usernames; keeping memory bounded must not wipe a guessed
+    account's count."""
     limiter = security.LoginRateLimiter(max_buckets=100)
     for _ in range(8):
-        limiter.check("alice")
+        limiter.check("alice", "10.0.0.1")
     for i in range(500):
-        limiter.check(f"spray{i}")
+        limiter.check(f"spray{i}", "10.0.0.1")
     assert len(limiter._user) <= 101
     with pytest.raises(TooManyRequests):
-        limiter.check("alice")
+        limiter.check("alice", "10.0.0.1")
 
 
 def test_concurrent_guesses_respect_user_limit(anon, monkeypatch):
@@ -306,17 +357,17 @@ def test_lockout_wait_uses_the_full_bucket(monkeypatch):
     clock = [1000.0]
     monkeypatch.setattr(security, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     limiter = security.LoginRateLimiter()
-    limiter.check("housemate")
+    limiter.check("housemate", "10.0.0.1")
     limiter.failure("10.0.0.1")
     clock[0] += 14 * 60
     for _ in range(8):
-        limiter.check("alice")
+        limiter.check("alice", "10.0.0.1")
         limiter.failure("10.0.0.1")
     clock[0] += 10
     with pytest.raises(TooManyRequests) as exc:
-        limiter.check("alice")
+        limiter.check("alice", "10.0.0.1")
     assert "about 15 minutes" in exc.value.message
     clock[0] += 14 * 60 + 20
     with pytest.raises(TooManyRequests) as exc:
-        limiter.check("alice")
+        limiter.check("alice", "10.0.0.1")
     assert "about 1 minute." in exc.value.message

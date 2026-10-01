@@ -40,6 +40,27 @@ def _sizes(db, source_id: str) -> list[tuple[float, float]]:  # noqa: ANN001
     return [(r[0], r[1]) for r in rows]
 
 
+def _store_sizes(db, source_id: str, sizes: list[tuple[float, float]]) -> list[tuple[float, float]]:  # noqa: ANN001
+    """Correct the stored page sizes of a source to ``sizes``, just measured from its file.
+    Returns the stored sizes."""
+    rows = list(db.scalars(select(SourcePage).where(SourcePage.source_id == source_id).order_by(SourcePage.idx)))
+    for row in rows:
+        if row.idx < len(sizes) and (row.width_pt, row.height_pt) != tuple(sizes[row.idx]):
+            row.width_pt, row.height_pt = sizes[row.idx]
+    return [(row.width_pt, row.height_pt) for row in rows]
+
+
+def remeasure(source_id: str) -> None:
+    """Measure the pages of a stored upload again and correct their stored sizes.
+
+    Older releases stored the size of the raw CropBox, which is not what viewers show when it
+    reaches past the MediaBox, so such pages were drawn distorted.
+    """
+    sizes = pool.run(pdfops.page_sizes, str(source_path(source_id)))
+    with write_session() as db:
+        _store_sizes(db, source_id, sizes)
+
+
 def _ingest(tmp: Path, out: Path) -> dict[str, Any]:
     try:
         return pool.run(pdfops.ingest, str(tmp), str(out))
@@ -55,30 +76,37 @@ def _place(out: Path, dest: Path) -> None:
 def store_upload(user_id: str, tmp: Path, sha256: str, size: int, filename: str) -> dict[str, Any]:
     """Validate and store an uploaded file (already streamed to ``tmp``).
 
-    Identical files uploaded again by the same user reuse the stored copy. The worker
-    writes the validated copy into the tmp directory (swept by maintenance); it is moved
-    into ``sources/`` only together with its database row, so a failed or timed-out
-    upload never leaves an untracked file there.
+    Identical files uploaded again by the same user reuse the stored copy, whose pages are
+    measured again (see ``remeasure``). The worker writes the validated copy into the tmp
+    directory (swept by maintenance); it is moved into ``sources/`` only together with its
+    database row, so a failed or timed-out upload never leaves an untracked file there.
     """
     filename = (filename or "").strip()[:255]
     with read_session() as db:
         existing = db.scalar(select(Source).where(Source.owner_id == user_id, Source.sha256 == sha256))
         existing_id = existing.id if existing is not None else None
-        sizes = _sizes(db, existing_id) if existing_id else []
     out = tmp_dir() / f"ingest-{new_id()}.pdf"
     try:
         info: dict[str, Any] | None = None
         if existing_id is not None:
-            if not source_path(existing_id).exists():
+            if source_path(existing_id).exists():
+                # The upload has the same bytes as the file stored back then; measuring it does not
+                # depend on maintenance leaving the stored copy alone in the meantime.
+                sizes = pool.run(pdfops.page_sizes, str(tmp))
+            else:
                 # The stored file went missing (e.g. restored from an old backup); store it again.
                 info = _ingest(tmp, out)
+                sizes = info["sizes"]
             with write_session() as db:
                 src = db.get(Source, existing_id)
                 if src is not None:
                     if info is not None:
                         _place(out, source_path(existing_id))
                     src.orphaned_at = None
-                    return _describe(src, sizes)
+                    # The startup backfill skips unused uploads and missing files: its text may not
+                    # be indexed yet.
+                    text_indexer.enqueue(existing_id)
+                    return _describe(src, _store_sizes(db, existing_id, sizes))
             # Maintenance deleted the unused stored copy in the meantime; store the file anew.
         if info is None:
             info = _ingest(tmp, out)

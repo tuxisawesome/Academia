@@ -34,6 +34,7 @@ from ..models import (
 )
 from .common import ancestors, chunks, clean_name, owned_folder_or_root, segments, segments_label
 from .describe import live_pages_with_sizes, node_base, page_json
+from .textindex import text_indexer
 from .tree import require_notebook
 
 
@@ -265,6 +266,8 @@ def insert_source(
         touched.append(bm_id)
     if src.orphaned_at is not None:
         src.orphaned_at = None
+        # The startup backfill skips unused uploads: its text may not be indexed yet.
+        text_indexer.enqueue(src.id)
     node, nb = require_notebook(db, user_id, notebook_id)
     _bump(db, node, nb, len(order), touched)
     return new_ids

@@ -197,6 +197,8 @@ function useItemBehavior(node: LibraryNode, props: ItemViewProps) {
       },
       onClick: (e: React.MouseEvent) => {
         e.stopPropagation();
+        // React bubbles clicks in the item's portalled "…" menu up to here too: they are not on the item.
+        if (!e.currentTarget.contains(e.target as Node)) return;
         if (pointerType.current === "touch" && !selectionMode && !(e.target as HTMLElement).closest(".item-check")) {
           open(node);
           return;
@@ -206,7 +208,7 @@ function useItemBehavior(node: LibraryNode, props: ItemViewProps) {
       },
       onDoubleClick: (e: React.MouseEvent) => {
         e.stopPropagation();
-        if (pointerType.current !== "touch") open(node);
+        if (pointerType.current !== "touch" && e.currentTarget.contains(e.target as Node)) open(node);
       },
       onDragStart: (e: React.DragEvent) => {
         let ids = [node.id];
