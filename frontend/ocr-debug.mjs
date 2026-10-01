@@ -1,0 +1,16 @@
+import { chromium } from "@playwright/test";
+const BASE = "http://127.0.0.1:8766";
+const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", args: ["--enable-unsafe-webgpu"] });
+const ctx = await browser.newContext();
+await ctx.addInitScript(() => { localStorage.setItem("academia-recognition-enabled", "1"); localStorage.setItem("academia-recognition-model", "light"); });
+ctx.on("request", (r) => { if (!r.url().includes("/assets/")) console.log("REQ", r.method(), r.url().replace(BASE, "")); });
+ctx.on("response", (r) => { if (!r.url().includes("/assets/")) console.log("RES", r.status(), r.url().replace(BASE, "")); });
+const page = await ctx.newPage();
+page.on("console", (m) => console.log("console", m.type(), m.text().slice(0, 400)));
+await page.goto(BASE + "/login");
+await page.fill("#username", "admin");
+await page.fill("#password", "academia-dev-pass");
+await page.click("button:has-text('Sign in')");
+await page.waitForSelector(".explorer");
+await page.waitForTimeout(25000);
+await browser.close();

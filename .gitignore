@@ -1,0 +1,26 @@
+# Local data (development)
+/data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+
+# Frontend
+node_modules/
+/frontend/dist/
+/frontend/test-results/
+/frontend/playwright-report/
+/frontend/shot*.mjs
+
+# Build metadata written on the server
+/release.json
+
+# Editors / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

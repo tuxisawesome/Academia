@@ -1,0 +1,222 @@
+.settings {
+  max-width: 1040px;
+}
+
+.settings-layout {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  gap: 28px;
+  align-items: start;
+}
+
+.settings-nav {
+  display: grid;
+  gap: 2px;
+  position: sticky;
+  top: 0;
+}
+
+.settings-body {
+  display: grid;
+  gap: 18px;
+}
+
+.settings-card {
+  padding: 22px 24px 24px;
+}
+
+.settings-card h2 {
+  font-size: 22px;
+  margin-bottom: 6px;
+}
+
+.settings-card > p.muted {
+  margin-bottom: 16px;
+}
+
+.settings-card form {
+  max-width: 460px;
+}
+
+.button-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.export-options {
+  display: grid;
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.export-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 10px;
+}
+
+.export-list li {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+}
+
+.export-info {
+  flex: 1;
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+}
+
+.export-info small {
+  font-size: 12.5px;
+}
+
+.error-text {
+  color: var(--danger);
+}
+
+.about-list {
+  display: grid;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+
+.about-list > div {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+}
+
+.about-list dt {
+  color: var(--ink-muted);
+}
+
+.about-list dd {
+  margin: 0;
+}
+
+/* ---- Users admin ---- */
+
+.users-table {
+  overflow: hidden;
+}
+
+.ut-row {
+  display: grid;
+  grid-template-columns: minmax(200px, 1.4fr) minmax(140px, 1fr) minmax(170px, 1fr) 140px 48px;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  font-size: 14.5px;
+}
+
+.ut-row:last-child {
+  border-bottom: 0;
+}
+
+.ut-row.head {
+  font-size: 13px;
+  color: var(--ink-muted);
+  background: var(--bg-sunk);
+}
+
+.ut-row.disabled .ut-user {
+  opacity: 0.55;
+}
+
+.ut-user {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ut-names {
+  display: grid;
+  min-width: 0;
+}
+
+.ut-names strong {
+  font-weight: 500;
+}
+
+.avatar.sm {
+  width: 30px;
+  height: 30px;
+  font-size: 13px;
+  flex: none;
+}
+
+.temp-password {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 16px;
+  border-radius: var(--radius);
+  background: var(--bg-sunk);
+  border: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+
+.temp-password code {
+  flex: 1;
+  font-size: 20px;
+  letter-spacing: 0.06em;
+  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  user-select: all;
+}
+
+@media (max-width: 760px) {
+  .settings-layout {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+
+  .settings-nav {
+    position: static;
+    display: flex;
+    overflow-x: auto;
+  }
+
+  .settings-nav .side-link {
+    flex: none;
+  }
+
+  .settings-card {
+    padding: 18px 16px;
+  }
+
+  .ut-row {
+    grid-template-columns: minmax(0, 1fr) 48px;
+  }
+
+  .ut-row > span:nth-child(2),
+  .ut-row > span:nth-child(3),
+  .ut-row > span:nth-child(4) {
+    display: none;
+  }
+}
+
+.reading-progress {
+  display: grid;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.rp-numbers strong {
+  font-weight: 600;
+}
+
+.device-phase {
+  margin: 12px 0 8px;
+  color: var(--ink-muted);
+  font-size: 14.5px;
+}

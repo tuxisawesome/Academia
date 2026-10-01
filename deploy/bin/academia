@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#
+# academia — server administration commands (runs as the service user).
+#
+#   sudo academia list-users
+#   sudo academia create-user NAME [--admin]
+#   sudo academia reset-password NAME
+#   sudo academia set-admin NAME [--off]
+#   sudo academia backup | maintenance | db-status | version
+#
+set -euo pipefail
+
+if [[ $EUID -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+exec runuser -u academia -- env -i PATH=/usr/bin:/bin HOME=/var/lib/academia LANG=C.UTF-8 \
+  bash -c 'set -a; . /etc/academia/academia.env; set +a; exec /opt/academia/current/backend/.venv/bin/academia "$@"' \
+  academia "$@"

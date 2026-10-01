@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# academia-update — update Academia to the latest version, a specific version (--ref),
+# or roll back (--rollback). Run with sudo. See `academia-update --help`.
+#
+# This small wrapper fetches the requested version and then runs that version's
+# deploy/update.sh, so the update procedure itself is always the newest one.
+
+set -Eeuo pipefail
+
+SRC_DIR=/opt/academia/src
+CURRENT=/opt/academia/current
+CONF_FILE=/etc/academia/install.conf
+
+if [[ $EUID -ne 0 ]]; then
+  exec sudo -- "$0" "$@"
+fi
+
+exec 9>/run/academia-update.lock
+if ! flock -n 9; then
+  echo "Another Academia update is already running." >&2
+  exit 1
+fi
+
+ref="" rollback=0 args=()
+while (($#)); do
+  case $1 in
+    --ref) ref=${2:?--ref needs a branch, tag or commit}; shift ;;
+    --rollback) rollback=1; args+=("$1") ;;
+    -h | --help) exec bash "$CURRENT/deploy/update.sh" --help ;;
+    *) args+=("$1") ;;
+  esac
+  shift
+done
+
+if [[ $rollback -eq 1 ]]; then
+  exec bash "$CURRENT/deploy/update.sh" "${args[@]}"
+fi
+
+[[ -f $CONF_FILE && -d $SRC_DIR/.git ]] || {
+  echo "Academia doesn't seem to be installed here." >&2
+  exit 1
+}
+branch=$(sed -n 's/^BRANCH="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' "$CONF_FILE" | tail -n1)
+target=${ref:-${branch:-main}}
+
+echo "Checking for updates…"
+git -C "$SRC_DIR" fetch --prune --tags --quiet origin
+
+commit=""
+for candidate in "origin/$target" "refs/tags/$target" "$target"; do
+  if commit=$(git -C "$SRC_DIR" rev-parse --verify --quiet "$candidate^{commit}"); then break; fi
+  commit=""
+done
+if [[ -z $commit ]]; then
+  echo "Couldn't find version '$target'." >&2
+  exit 1
+fi
+
+work=$(mktemp -d /tmp/academia-update.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+git -C "$SRC_DIR" archive "$commit" deploy | tar -x -C "$work"
+bash "$work/deploy/update.sh" --commit "$commit" "${args[@]}"

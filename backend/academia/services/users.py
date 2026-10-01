@@ -1,0 +1,179 @@
+"""User accounts (managed by admins; there is no self sign-up)."""
+
+from __future__ import annotations
+
+import re
+from typing import Any
+
+from sqlalchemy import delete, func, select
+from sqlalchemy.orm import Session
+
+from ..errors import BadRequest, Conflict, NotFound
+from ..models import NOTEBOOK, Node, Source, User, utcnow
+from ..security import generate_password, hash_password, revoke_user_sessions, validate_new_password
+from ..storage import remove_source_files
+
+USERNAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+DEFAULT_PREFS: dict[str, Any] = {
+    "theme": "system",
+    "view": "grid",
+    "sort": {"key": "name", "dir": "asc"},
+    "reader": {"layout": "auto", "cover_alone": False},
+}
+
+
+def user_json(user: User) -> dict[str, Any]:
+    prefs = {**DEFAULT_PREFS, **(user.prefs or {})}
+    return {
+        "id": user.id,
+        "username": user.username,
+        "display_name": user.display_name or user.username,
+        "is_admin": user.is_admin,
+        "must_change_password": user.must_change_password,
+        "disabled": user.disabled_at is not None,
+        "created_at": user.created_at,
+        "last_login_at": user.last_login_at,
+        "prefs": prefs,
+    }
+
+
+def validate_username(username: str) -> str:
+    username = (username or "").strip()
+    if not USERNAME_RE.match(username):
+        raise BadRequest(
+            "Usernames are 1–64 characters: letters, digits, dots, dashes and underscores.",
+            code="invalid_username",
+        )
+    return username
+
+
+def find_user(db: Session, username: str) -> User | None:
+    return db.scalar(select(User).where(User.username == username.strip()))
+
+
+def create_user(
+    db: Session,
+    username: str,
+    display_name: str = "",
+    password: str | None = None,
+    is_admin: bool = False,
+    must_change: bool = True,
+) -> tuple[User, str | None]:
+    username = validate_username(username)
+    if find_user(db, username) is not None:
+        raise Conflict("That username is already taken.", code="username_taken")
+    generated = None
+    if password:
+        validate_new_password(password)
+    else:
+        password = generated = generate_password()
+    user = User(
+        username=username,
+        display_name=(display_name or "").strip()[:128],
+        password_hash=hash_password(password),
+        is_admin=is_admin,
+        must_change_password=must_change,
+        prefs={},
+    )
+    db.add(user)
+    db.flush()
+    return user, generated
+
+
+def _active_admin_count(db: Session) -> int:
+    return (
+        db.scalar(select(func.count()).select_from(User).where(User.is_admin.is_(True), User.disabled_at.is_(None)))
+        or 0
+    )
+
+
+def _guard_last_admin(db: Session, user: User) -> None:
+    if user.is_admin and user.disabled_at is None and _active_admin_count(db) <= 1:
+        raise Conflict("This is the only active administrator.", code="last_admin")
+
+
+def update_user(
+    db: Session,
+    actor: User,
+    user_id: str,
+    *,
+    display_name: str | None = None,
+    is_admin: bool | None = None,
+    disabled: bool | None = None,
+    reset_password: bool = False,
+) -> tuple[User, str | None]:
+    user = db.get(User, user_id)
+    if user is None:
+        raise NotFound("User not found.")
+    if display_name is not None:
+        user.display_name = display_name.strip()[:128]
+    if is_admin is not None and is_admin != user.is_admin:
+        if user.id == actor.id:
+            raise BadRequest("You can't change your own administrator role.", code="self_change")
+        if not is_admin:
+            _guard_last_admin(db, user)
+        user.is_admin = is_admin
+    if disabled is not None and disabled != (user.disabled_at is not None):
+        if user.id == actor.id:
+            raise BadRequest("You can't disable your own account.", code="self_change")
+        if disabled:
+            _guard_last_admin(db, user)
+            user.disabled_at = utcnow()
+            revoke_user_sessions(db, user.id)
+        else:
+            user.disabled_at = None
+    generated = None
+    if reset_password:
+        generated = generate_password()
+        user.password_hash = hash_password(generated)
+        user.must_change_password = True
+        revoke_user_sessions(db, user.id)
+    db.flush()
+    return user, generated
+
+
+def delete_user(db: Session, actor: User | None, user_id: str) -> list[str]:
+    """Delete a user and all of their data. Returns source ids whose files should be removed."""
+    user = db.get(User, user_id)
+    if user is None:
+        raise NotFound("User not found.")
+    if actor is not None and user.id == actor.id:
+        raise BadRequest("You can't delete your own account.", code="self_change")
+    _guard_last_admin(db, user)
+    source_ids = list(db.scalars(select(Source.id).where(Source.owner_id == user.id)))
+    # Delete the tree first so pages go before the sources they reference.
+    db.execute(delete(Node).where(Node.owner_id == user.id, Node.parent_id.is_(None)))
+    db.execute(delete(Node).where(Node.owner_id == user.id))
+    db.execute(delete(Source).where(Source.owner_id == user.id))
+    db.delete(user)
+    db.flush()
+    return source_ids
+
+
+def remove_files(source_ids: list[str]) -> None:
+    for sid in source_ids:
+        remove_source_files(sid)
+
+
+def list_users(db: Session) -> list[dict[str, Any]]:
+    usage = dict(
+        db.execute(
+            select(Source.owner_id, func.coalesce(func.sum(Source.byte_size), 0)).group_by(Source.owner_id)
+        ).all()
+    )
+    notebooks = dict(
+        db.execute(
+            select(Node.owner_id, func.count())
+            .where(Node.kind == NOTEBOOK, Node.trashed_at.is_(None))
+            .group_by(Node.owner_id)
+        ).all()
+    )
+    out = []
+    for user in db.scalars(select(User).order_by(func.lower(User.username))):
+        item = user_json(user)
+        item.pop("prefs", None)
+        item["storage_bytes"] = int(usage.get(user.id, 0))
+        item["notebook_count"] = int(notebooks.get(user.id, 0))
+        out.append(item)
+    return out

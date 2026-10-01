@@ -1,0 +1,167 @@
+/*
+ * Academia design tokens — warm "paper and ink" palette.
+ * Light is the default; dark applies with the OS preference unless the user picked
+ * a theme explicitly (html[data-theme]).
+ */
+
+:root {
+  color-scheme: light;
+
+  --font-body: "Source Serif 4 Variable", "Source Serif 4", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-display: "EB Garamond Variable", "EB Garamond", Garamond, "Iowan Old Style", Georgia, serif;
+
+  --bg: #f5efe3;
+  --bg-elev: #fbf7ee;
+  --bg-raised: #fffdf8;
+  --bg-sunk: #efe7d7;
+  --bg-hover: rgba(88, 62, 34, 0.07);
+  --bg-active: rgba(88, 62, 34, 0.12);
+  --border: #ddd2bd;
+  --border-strong: #c8b99c;
+  --ink: #2a241e;
+  --ink-muted: #6e6353;
+  --ink-faint: #9a8e7c;
+
+  --accent: #7b2d26;
+  --accent-hover: #662219;
+  --accent-ink: #fbf7ee;
+  --accent-soft: rgba(123, 45, 38, 0.1);
+  --accent-softer: rgba(123, 45, 38, 0.06);
+  --gold: #a8823f;
+  --gold-soft: rgba(168, 130, 63, 0.16);
+
+  --select: rgba(123, 45, 38, 0.11);
+  --select-strong: rgba(123, 45, 38, 0.2);
+  --select-border: #9b4a40;
+  --focus-ring: #b8923f;
+
+  --danger: #9b2c2c;
+  --danger-soft: rgba(155, 44, 44, 0.1);
+  --success: #3e6b48;
+  --warning: #9a6a16;
+
+  --paper: #ffffff;
+  --paper-edge: rgba(60, 40, 20, 0.14);
+  --shadow-sm: 0 1px 2px rgba(60, 40, 20, 0.08);
+  --shadow-md: 0 4px 14px rgba(60, 40, 20, 0.1), 0 1px 3px rgba(60, 40, 20, 0.08);
+  --shadow-lg: 0 18px 50px rgba(50, 32, 14, 0.18), 0 4px 12px rgba(50, 32, 14, 0.1);
+  --scrim: rgba(38, 28, 18, 0.38);
+  --reader-bg: #e9e1d1;
+
+  --folder-default: #b89a62;
+  --fc-oxblood: #8b3a32;
+  --fc-terracotta: #b5603a;
+  --fc-ochre: #b8892e;
+  --fc-olive: #6f7a3a;
+  --fc-forest: #3f6b4a;
+  --fc-teal: #2f6f6e;
+  --fc-slate: #5a6e85;
+  --fc-navy: #2e4a73;
+  --fc-plum: #6e4266;
+  --fc-graphite: #55504a;
+
+  --radius-sm: 5px;
+  --radius: 8px;
+  --radius-lg: 12px;
+  --header-h: 56px;
+  --sidebar-w: 264px;
+  --ease: cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #191612;
+    --bg-elev: #221e19;
+    --bg-raised: #2a251f;
+    --bg-sunk: #14110e;
+    --bg-hover: rgba(237, 229, 213, 0.06);
+    --bg-active: rgba(237, 229, 213, 0.1);
+    --border: #3a332a;
+    --border-strong: #4d4437;
+    --ink: #ede5d5;
+    --ink-muted: #b3a792;
+    --ink-faint: #857a69;
+    --accent: #d0796c;
+    --accent-hover: #dc8d81;
+    --accent-ink: #1b1511;
+    --accent-soft: rgba(208, 121, 108, 0.15);
+    --accent-softer: rgba(208, 121, 108, 0.08);
+    --gold: #cda864;
+    --gold-soft: rgba(205, 168, 100, 0.16);
+    --select: rgba(208, 121, 108, 0.14);
+    --select-strong: rgba(208, 121, 108, 0.24);
+    --select-border: #d0796c;
+    --focus-ring: #cda864;
+    --danger: #e0766a;
+    --danger-soft: rgba(224, 118, 106, 0.14);
+    --success: #7fb08a;
+    --warning: #d9ae55;
+    --paper: #f7f3ea;
+    --paper-edge: rgba(0, 0, 0, 0.5);
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+    --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.35);
+    --scrim: rgba(0, 0, 0, 0.55);
+    --reader-bg: #12100d;
+    --folder-default: #9c8458;
+    --fc-oxblood: #c9776c;
+    --fc-terracotta: #d98a62;
+    --fc-ochre: #d9ae55;
+    --fc-olive: #a3ae66;
+    --fc-forest: #74a383;
+    --fc-teal: #62a6a4;
+    --fc-slate: #8fa3ba;
+    --fc-navy: #7390be;
+    --fc-plum: #a97ba0;
+    --fc-graphite: #9a948c;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #191612;
+  --bg-elev: #221e19;
+  --bg-raised: #2a251f;
+  --bg-sunk: #14110e;
+  --bg-hover: rgba(237, 229, 213, 0.06);
+  --bg-active: rgba(237, 229, 213, 0.1);
+  --border: #3a332a;
+  --border-strong: #4d4437;
+  --ink: #ede5d5;
+  --ink-muted: #b3a792;
+  --ink-faint: #857a69;
+  --accent: #d0796c;
+  --accent-hover: #dc8d81;
+  --accent-ink: #1b1511;
+  --accent-soft: rgba(208, 121, 108, 0.15);
+  --accent-softer: rgba(208, 121, 108, 0.08);
+  --gold: #cda864;
+  --gold-soft: rgba(205, 168, 100, 0.16);
+  --select: rgba(208, 121, 108, 0.14);
+  --select-strong: rgba(208, 121, 108, 0.24);
+  --select-border: #d0796c;
+  --focus-ring: #cda864;
+  --danger: #e0766a;
+  --danger-soft: rgba(224, 118, 106, 0.14);
+  --success: #7fb08a;
+  --warning: #d9ae55;
+  --paper: #f7f3ea;
+  --paper-edge: rgba(0, 0, 0, 0.5);
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.35);
+  --shadow-md: 0 4px 14px rgba(0, 0, 0, 0.4), 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 18px 50px rgba(0, 0, 0, 0.55), 0 4px 12px rgba(0, 0, 0, 0.35);
+  --scrim: rgba(0, 0, 0, 0.55);
+  --reader-bg: #12100d;
+  --folder-default: #9c8458;
+  --fc-oxblood: #c9776c;
+  --fc-terracotta: #d98a62;
+  --fc-ochre: #d9ae55;
+  --fc-olive: #a3ae66;
+  --fc-forest: #74a383;
+  --fc-teal: #62a6a4;
+  --fc-slate: #8fa3ba;
+  --fc-navy: #7390be;
+  --fc-plum: #a97ba0;
+  --fc-graphite: #9a948c;
+}

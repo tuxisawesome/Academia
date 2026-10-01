@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#F5EFE3" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content="#191612" media="(prefers-color-scheme: dark)" />
+    <meta http-equiv="refresh" content="20" />
+    <title>Academia — Offline</title>
+    <style>
+      :root {
+        --bg: #f5efe3;
+        --card: #fbf7ee;
+        --ink: #2a241e;
+        --muted: #6e6353;
+        --line: #ddd2bd;
+        --accent: #7b2d26;
+        --accent-ink: #fbf7ee;
+        color-scheme: light dark;
+      }
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #191612;
+          --card: #221e19;
+          --ink: #ede5d5;
+          --muted: #b3a792;
+          --line: #3a332a;
+          --accent: #d0796c;
+          --accent-ink: #1b1511;
+        }
+      }
+      * { box-sizing: border-box; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        display: grid;
+        place-items: center;
+        padding: 24px;
+        background: var(--bg);
+        color: var(--ink);
+        font-family: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Times New Roman", serif;
+        -webkit-font-smoothing: antialiased;
+      }
+      main {
+        max-width: 420px;
+        width: 100%;
+        text-align: center;
+        background: var(--card);
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 40px 32px 32px;
+        box-shadow: 0 10px 30px rgba(60, 40, 20, 0.08);
+      }
+      svg { width: 72px; height: 72px; margin-bottom: 12px; }
+      h1 { font-weight: 500; font-size: 28px; margin: 0 0 8px; letter-spacing: 0.01em; }
+      p { color: var(--muted); line-height: 1.55; margin: 0 0 24px; font-size: 16px; }
+      .button {
+        display: inline-block;
+        font-size: 16px;
+        padding: 10px 22px;
+        border-radius: 8px;
+        background: var(--accent);
+        color: var(--accent-ink);
+        text-decoration: none;
+      }
+      .button:focus-visible { outline: 3px solid #cda864; outline-offset: 2px; }
+      .wordmark { margin-top: 28px; font-size: 13px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--muted); }
+    </style>
+  </head>
+  <body>
+    <main>
+      <svg viewBox="0 0 512 512" aria-hidden="true">
+        <rect width="512" height="512" rx="112" fill="#7B2D26" />
+        <path d="M256 170c-38-26-92-36-150-30v214c58-6 112 4 150 30z" fill="#F7F1E5" />
+        <path d="M256 170c38-26 92-36 150-30v214c-58-6-112 4-150 30z" fill="#EADFC8" />
+        <path d="M322 128h44v146l-22-18-22 18z" fill="#CDA864" />
+      </svg>
+      <h1>You're offline</h1>
+      <p>Academia needs an internet connection. Connect to the internet and try again.</p>
+      <!-- An empty href reloads the page that was requested. No script: the app's CSP forbids inline code. -->
+      <a class="button" href="">Try again</a>
+      <div class="wordmark">Academia</div>
+    </main>
+  </body>
+</html>
